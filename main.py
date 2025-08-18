@@ -1783,7 +1783,7 @@ async def run_openai_completion(prompt):
                 }
 
                 payload = {
-                    "model": "gpt-5-mini",      
+                    "model": "gpt-5",      
                     "input": prompt,                
                     "max_output_tokens": 1200,      
                  
