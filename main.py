@@ -51,9 +51,6 @@ from cryptography.hazmat.primitives.hashes import SHA3_512
 from argon2.low_level import hash_secret_raw, Type as ArgonType
 from numpy.random import Generator, PCG64DXSM
 import itertools
-import os
-import itertools
-import numpy as np
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -99,10 +96,7 @@ if not ADMIN_USERNAME or not ADMIN_PASS:
 
 if 'parse_safe_float' not in globals():
     def parse_safe_float(val) -> float:
-        """
-        Reject NaN/Inf in any casing/synonym and ensure finiteness.
-        Prevents undefined behavior from float('nan') etc.
-        """
+
         s = str(val).strip()
         bad = {'nan', '+nan', '-nan', 'inf', '+inf', '-inf', 'infinity', '+infinity', '-infinity'}
         if s.lower() in bad:
@@ -142,28 +136,9 @@ def _chaotic_three_fry_mix(buf: bytes) -> bytes:
     return struct.pack('>4Q', *words)
 
 
-def validate_password_strength(password: str) -> bool:
-
-    if not password or len(password) < 12:
-        return False
-
-    if not re.search(r"[A-Z]", password):
-        return False
-    if not re.search(r"[a-z]", password):
-        return False
-    if not re.search(r"[0-9]", password):
-        return False
-    if not re.search(r"[\W_]", password):
-        return False
-
-    return True
-
-
 def generate_very_strong_secret_key():
 
     global _entropy_state
-
-    import os, secrets, uuid, psutil, time, threading, hashlib, numpy as np
 
     E = [
         os.urandom(64),
@@ -745,8 +720,6 @@ def collect_entropy(sources=None) -> int:
     return int.from_bytes(combined_entropy, 'big') % 2**512
 
 
-
-
 def fetch_entropy_logs():
     with sqlite3.connect(DB_FILE) as db:
         cursor = db.cursor()
@@ -762,6 +735,7 @@ def fetch_entropy_logs():
     } for row in logs]
 
     return decrypted_logs
+
 
 def delete_expired_data():
     while True:
@@ -836,6 +810,7 @@ def delete_expired_data():
         interval = random.randint(5400, 10800)
         time.sleep(interval)
 
+
 def delete_user_data(user_id):
     try:
         with sqlite3.connect(DB_FILE) as db:
@@ -867,6 +842,7 @@ def delete_user_data(user_id):
         logger.error(
             f"Failed to securely delete data for user_id {user_id}: {e}",
             exc_info=True)
+
 
 data_deletion_thread = threading.Thread(target=delete_expired_data,
                                         daemon=True)
@@ -969,6 +945,7 @@ def approximate_nearest_city(
 
 CityMap = Dict[str, Any]
 
+
 def _coerce_city_index(cities_opt: Optional[Mapping[str, Any]]) -> CityMap:
     if cities_opt is not None:
         return {str(k): v for k, v in cities_opt.items()}
@@ -977,18 +954,21 @@ def _coerce_city_index(cities_opt: Optional[Mapping[str, Any]]) -> CityMap:
         return {str(k): v for k, v in gc.items()}
     return {}
 
+
 def _coords_valid(lat: float, lon: float) -> bool:
     return math.isfinite(lat) and -90 <= lat <= 90 and math.isfinite(lon) and -180 <= lon <= 180
 
 
 _BASE_FMT = re.compile(r'^\s*"?(?P<city>[^,"\n]+)"?\s*,\s*"?(?P<county>[^,"\n]*)"?\s*,\s*"?(?P<state>[^,"\n]+)"?\s*$')
 
+
 def _split_country(line: str) -> Tuple[str, str]:
-    """Split optional country on the right of an em-dash or hyphen."""
+
     m = re.search(r'\s+[—-]\s+(?P<country>[^"\n]+)\s*$', line)
     if not m:
         return line.strip(), ""
     return line[:m.start()].strip(), m.group("country").strip().strip('"')
+
 
 def _parse_base(left: str) -> Tuple[str, str, str]:
     m = _BASE_FMT.match(left)
@@ -999,8 +979,10 @@ def _parse_base(left: str) -> Tuple[str, str, str]:
     state  = m.group("state").strip().strip('"')
     return city, county, state
 
+
 def _first_line_stripped(text: str) -> str:
     return (text or "").splitlines()[0].strip()
+
 
 async def fetch_street_name_llm(
     lat: float,
@@ -1078,10 +1060,8 @@ or
         logger.info("LLM output failed format guard (%s); using fallback.", first)
         return reverse_geocode(lat, lon, city_index)
 
-   
     country = (country or likely_country_code or "US").strip()
 
-  
     return f"{city}, {county}, {state} — {country}"
 
 
@@ -1176,10 +1156,8 @@ def quantum_haversine_hints(
     top = [r[1] for r in rows[:max(1, top_k)]]
     nearest = top[0]
 
-    
     unknownish = nearest["_distance_km"] > 350.0
 
- 
     parts = []
     for i, c in enumerate(top, 1):
         line = (
@@ -1201,6 +1179,7 @@ def reverse_geocode(lat: float, lon: float, cities: Dict[str, Any]) -> str:
     if nearest:
         return _format_locality_line(nearest)
     return "Unknown Location"
+
 
 def approximate_country(lat: float, lon: float, cities: Dict[str, Any]) -> str:
     hints = quantum_haversine_hints(lat, lon, cities, top_k=1)
@@ -1595,10 +1574,7 @@ def quantum_hazard_scan(cpu_usage, ram_usage):
 
 
 async def phf_filter_input(input_text: str) -> tuple[bool, str]:
-    """
-    Probabilistic Harm Filtering using only OpenAI.
-    Returns (is_safe: bool, detail: str).
-    """
+
     logger.debug(
         "Entering phf_filter_input (OpenAI-only) with input length %d",
         len(input_text) if isinstance(input_text, str) else 0)
@@ -3716,6 +3692,9 @@ async def start_scan_route():
     username = session['username']
     user_id = get_user_id(username)
 
+    if user_id is None:
+        return jsonify({"error": "User not found"}), 404
+
     if not session.get('is_admin', False):
         if not check_rate_limit(user_id):
             return jsonify({"error":
@@ -3723,17 +3702,11 @@ async def start_scan_route():
 
     data = request.get_json()
 
-    lat = data.get('latitude')
-    lon = data.get('longitude')
-    vehicle_type = data.get('vehicle_type')
-    destination = data.get('destination')
-    model_selection = data.get('model_selection')
-
-    lat = sanitize_input(lat)
-    lon = sanitize_input(lon)
-    vehicle_type = sanitize_input(vehicle_type)
-    destination = sanitize_input(destination)
-    model_selection = sanitize_input(model_selection)
+    lat = sanitize_input(data.get('latitude'))
+    lon = sanitize_input(data.get('longitude'))
+    vehicle_type = sanitize_input(data.get('vehicle_type'))
+    destination = sanitize_input(data.get('destination'))
+    model_selection = sanitize_input(data.get('model_selection'))
 
     if not lat or not lon or not vehicle_type or not destination or not model_selection:
         return jsonify({"error": "Missing required data"}), 400
@@ -3758,14 +3731,17 @@ async def start_scan_route():
         vehicle_type,
         destination,
         user_id,
-        selected_model=model_selection)
+        selected_model=model_selection
+    )
 
     harm_level = calculate_harm_level(result)
 
-    report_id = save_hazard_report(lat_float, lon_float, street_name,
-                                   vehicle_type, destination, result,
-                                   cpu_usage, ram_usage, quantum_results,
-                                   user_id, harm_level, model_used)
+    report_id = save_hazard_report(
+        lat_float, lon_float, street_name,
+        vehicle_type, destination, result,
+        cpu_usage, ram_usage, quantum_results,
+        user_id, harm_level, model_used
+    )
 
     return jsonify({
         "message": "Scan completed successfully",
@@ -3802,19 +3778,17 @@ async def reverse_geocode_route():
 
     try:
         street_name = await fetch_street_name_llm(lat, lon)
-        logger.info(
-            f"Successfully resolved street name using LLM: {street_name}")
+        logger.info(f"Successfully resolved street name using LLM: {street_name}")
         return jsonify({"street_name": street_name}), 200
     except Exception as e:
         logger.warning(
             "LLM geocoding failed, falling back to standard reverse_geocode.",
-            exc_info=True)
+            exc_info=True
+        )
 
         try:
             street_name = reverse_geocode(lat, lon, cities)
-            logger.info(
-                f"Successfully resolved street name using fallback method: {street_name}"
-            )
+            logger.info(f"Successfully resolved street name using fallback method: {street_name}")
             return jsonify({"street_name": street_name}), 200
         except Exception as fallback_e:
             logger.exception(
