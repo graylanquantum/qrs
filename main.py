@@ -1615,20 +1615,21 @@ async def phf_filter_input(input_text: str) -> tuple[bool, str]:
     logger.warning("PHF processing failed; defaulting to Unsafe.")
     return False, "PHF processing failed."
 
-
 async def scan_debris_for_route(
-        lat: float,
-        lon: float,
-        vehicle_type: str,
-        destination: str,
-        user_id: int,
-        selected_model: str = None) -> tuple[str, str, str, str, str, str]:
+    lat: float,
+    lon: float,
+    vehicle_type: str,
+    destination: str,
+    user_id: int,
+    selected_model: str | None = None
+) -> tuple[str, str, str, str, str, str]:
 
     logger.debug(
         "Entering scan_debris_for_route: lat=%s, lon=%s, vehicle=%s, dest=%s, user=%s",
-        lat, lon, vehicle_type, destination, user_id)
+        lat, lon, vehicle_type, destination, user_id
+    )
 
-    model_used = "OpenAI"
+    model_used = selected_model or "OpenAI"
 
     try:
         cpu_usage, ram_usage = get_cpu_ram_usage()
@@ -1673,14 +1674,14 @@ Please assess the following:
 [refrain from using the word high or metal and only use it only if risk elementaries are elevated(ie flat tire or accidents or other risk) utilizing your quantum scan intelligence]
 """
 
-    report = await run_openai_completion(openai_prompt
-                                         ) or "OpenAI failed to respond."
+ 
+    raw_report: Optional[str] = await run_openai_completion(openai_prompt)
+    report: str = raw_report if raw_report is not None else "OpenAI failed to respond."
     report = report.strip()
 
     harm_level = calculate_harm_level(report)
 
-    logger.debug("Exiting scan_debris_for_route with model_used=%s",
-                 model_used)
+    logger.debug("Exiting scan_debris_for_route with model_used=%s", model_used)
     return (
         report,
         f"{cpu_usage}",
@@ -1714,7 +1715,6 @@ async def run_openai_completion(prompt):
 
         if isinstance(payload.get("text"), str) and payload["text"].strip():
             return payload["text"].strip()
-
 
         out = payload.get("output")
         if isinstance(out, list) and out:
