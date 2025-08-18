@@ -32,7 +32,7 @@ import time
 import hmac
 import hashlib
 import secrets
-from typing import Tuple, Callable, Dict, List, Union
+from typing import Tuple, Callable, Dict, List, Union, Any, Optional, Mapping
 import uuid
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -883,74 +883,207 @@ gc = geonamescache.GeonamesCache()
 cities = gc.get_cities()
 
 
-def approximate_nearest_city(lat, lon, cities):
-    nearest_city = None
-    min_distance = float('inf')
-    for city in cities.values():
-        try:
-            city_lat = float(city['latitude'])
-            city_lon = float(city['longitude'])
-            distance = quantum_haversine_distance(lat, lon, city_lat, city_lon)
-            if distance < min_distance:
-                min_distance = distance
-                nearest_city = city
-        except:
+def _safe_get(d: Dict[str, Any], keys: List[str], default: str = "") -> str:
+    for k in keys:
+        v = d.get(k)
+        if v is not None and v != "":
+            return str(v)
+    return default
+
+
+def _initial_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    φ1, φ2 = map(math.radians, [lat1, lat2])
+    Δλ = math.radians(lon2 - lon1)
+    y = math.sin(Δλ) * math.cos(φ2)
+    x = math.cos(φ1) * math.sin(φ2) - math.sin(φ1) * math.cos(φ2) * math.cos(Δλ)
+    θ = math.degrees(math.atan2(y, x))
+    return (θ + 360.0) % 360.0
+
+
+def _bearing_to_cardinal(bearing: float) -> str:
+    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
+            "S","SSW","SW","WSW","W","WNW","NW","NNW"]
+    idx = int((bearing + 11.25) // 22.5) % 16
+    return dirs[idx]
+
+
+def _format_locality_line(city: Dict[str, Any]) -> str:
+
+    name   = _safe_get(city, ["name", "city", "locality"], "Unknown")
+    county = _safe_get(city, ["county", "admin2", "district"], "")
+    state  = _safe_get(city, ["state", "region", "admin1"], "")
+    country= _safe_get(city, ["country", "countrycode", "cc"], "UNKNOWN")
+
+    country = country.upper() if len(country) <= 3 else country
+    return f"{name}, {county}, {state} — {country}"
+
+
+def _finite_f(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+        return f if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+        
+
+def approximate_nearest_city(
+    lat: float,
+    lon: float,
+    cities: Dict[str, Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], float]:
+
+
+    if not (math.isfinite(lat) and -90.0 <= lat <= 90.0 and
+            math.isfinite(lon) and -180.0 <= lon <= 180.0):
+        raise ValueError(f"Invalid coordinates lat={lat}, lon={lon}")
+
+    nearest_city: Optional[Dict[str, Any]] = None
+    min_distance = float("inf")
+
+    for key, city in (cities or {}).items():
+ 
+        if not isinstance(city, dict):
             continue
+
+        lat_raw = city.get("latitude")
+        lon_raw = city.get("longitude")
+
+        city_lat = _finite_f(lat_raw)
+        city_lon = _finite_f(lon_raw)
+        if city_lat is None or city_lon is None:
+           
+            continue
+
+        try:
+            distance = quantum_haversine_distance(lat, lon, city_lat, city_lon)
+        except (TypeError, ValueError) as e:
+   
+            continue
+
+        if distance < min_distance:
+            min_distance = distance
+            nearest_city = city
+
     return nearest_city, min_distance
 
 
-def approximate_country(lat, lon, cities):
-    city, _ = approximate_nearest_city(lat, lon, cities)
-    if city:
-        return city.get('countrycode', 'UNKNOWN')
-    return 'UNKNOWN'
+CityMap = Dict[str, Any]
+
+def _coerce_city_index(cities_opt: Optional[Mapping[str, Any]]) -> CityMap:
+    if cities_opt is not None:
+        return {str(k): v for k, v in cities_opt.items()}
+    gc = globals().get("cities")
+    if isinstance(gc, Mapping):
+        return {str(k): v for k, v in gc.items()}
+    return {}
+
+def _coords_valid(lat: float, lon: float) -> bool:
+    return math.isfinite(lat) and -90 <= lat <= 90 and math.isfinite(lon) and -180 <= lon <= 180
 
 
-async def fetch_street_name_llm(lat: float, lon: float) -> str:
+_BASE_FMT = re.compile(r'^\s*"?(?P<city>[^,"\n]+)"?\s*,\s*"?(?P<county>[^,"\n]*)"?\s*,\s*"?(?P<state>[^,"\n]+)"?\s*$')
 
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        logger.error(
-            "OPENAI_API_KEY is missing. Falling back to local reverse_geocode."
-        )
-        return reverse_geocode(lat, lon, cities)
+def _split_country(line: str) -> Tuple[str, str]:
+    """Split optional country on the right of an em-dash or hyphen."""
+    m = re.search(r'\s+[—-]\s+(?P<country>[^"\n]+)\s*$', line)
+    if not m:
+        return line.strip(), ""
+    return line[:m.start()].strip(), m.group("country").strip().strip('"')
+
+def _parse_base(left: str) -> Tuple[str, str, str]:
+    m = _BASE_FMT.match(left)
+    if not m:
+        raise ValueError("format mismatch")
+    city   = m.group("city").strip().strip('"')
+    county = m.group("county").strip().strip('"')
+    state  = m.group("state").strip().strip('"')
+    return city, county, state
+
+def _first_line_stripped(text: str) -> str:
+    return (text or "").splitlines()[0].strip()
+
+async def fetch_street_name_llm(
+    lat: float,
+    lon: float,
+    cities: Optional[Mapping[str, Any]] = None,
+) -> str:
+    city_index: CityMap = _coerce_city_index(cities)
+
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.error("OPENAI_API_KEY is missing. Falling back to local reverse_geocode.")
+        return reverse_geocode(lat, lon, city_index)
+
+    if not _coords_valid(lat, lon):
+        logger.error("Invalid coordinates lat=%s lon=%s. Falling back.", lat, lon)
+        return reverse_geocode(lat, lon, city_index)
 
     try:
+        likely_country_code = approximate_country(lat, lon, city_index)  
+        nearest_city, distance_to_city = approximate_nearest_city(lat, lon, city_index)
+        city_hint = nearest_city.get("name", "Unknown") if nearest_city else "Unknown"
+        distance_hint = f"{distance_to_city:.2f} km from {city_hint}" if nearest_city else "Unknown"
+
         cpu, ram = get_cpu_ram_usage()
-        qres = quantum_hazard_scan(cpu, ram)
+        quantum_results = quantum_hazard_scan(cpu, ram)
+        quantum_state_str = str(quantum_results)
 
-        prompt = (
-            "[system]You are Hypertime-Geocoder-9000 — an elite precision "
-            "reverse-geocoding system utilizing hypertime-spectral interpolation, "
-            "quantum-probabilistic locality scanning (QPLS), and human-grade "
-            "geospatial heuristics. Accuracy is critical. Output must be clean "
-            "and formatted perfectly. Do not hallucinate.[/system]\n\n"
-            "[instructions]Your task is to take a pair of coordinates and return "
-            "the most probable populated locality that a human would associate with "
-            "this position (e.g. a town, city, or commonly referenced settlement). "
-            "If near a major metropolitan area, prefer the city name; if rural, "
-            "choose the nearest recognized town. If no settled area is reasonably "
-            "identifiable (e.g. deep ocean, uninhabited desert, arctic tundra), reply "
-            "*exactly* with: Unknown Location. Do not invent fictional places. "
-            "Return result in the STRICT format: City, County, State — Country. "
-            "If County is unknown leave it blank but keep comma (e.g. City, , State — Country). "
-            "Do NOT add latitude, longitude, commentary, explanation, or numbering.[/instructions]\n\n"
-            f"[coords]Latitude: {lat}, Longitude: {lon}[/coords]\n"
-            f"[context]LoadOut: CPU={cpu}%, RAM={ram}%, QuantumState={qres}[/context]\n"
-            "[format]City, County, State — Country OR Unknown Location[/format]"
-        )
+     
+        llm_prompt = f"""
+[action]You are an Advanced Hypertime Nanobot Reverse-Geocoder with quantum synergy. 
+Determine the most precise City, County, and State based on the provided coordinates 
+using quantum data, known city proximity, and any country/regional hints. 
+Discard uncertain data below 98% reliability.[/action]
 
-        result = await run_openai_completion(prompt)
-        if not result or "unknown" in result.lower():
-            logger.info("OpenAI returned unknown; using local fallback.")
-            return reverse_geocode(lat, lon, cities)
+[coordinates]
+Latitude: {lat}
+Longitude: {lon}
+[/coordinates]
 
-        clean = bleach.clean(result.strip(), tags=[], strip=True)
-        return clean
+[local_context]
+Nearest known city (heuristic): {city_hint}
+Distance to city: {distance_hint}
+Likely country code: {likely_country_code}
+Quantum state data: {quantum_state_str}
+[/local_context]
+
+[request_format]
+"City, County, State"
+or 
+"Unknown Location"
+[/request_format]
+""".strip()
+
+        result = await run_openai_completion(llm_prompt)
 
     except Exception as e:
-        logger.error("OpenAI geocoding failed: %s", e, exc_info=True)
-        return reverse_geocode(lat, lon, cities)
+        logger.error("Context/prep failed: %s", e, exc_info=True)
+        return reverse_geocode(lat, lon, city_index)
+
+    if not result:
+        logger.info("Empty OpenAI result; using fallback.")
+        return reverse_geocode(lat, lon, city_index)
+
+    clean = bleach.clean(result.strip(), tags=[], strip=True)
+    first = _first_line_stripped(clean)
+
+ 
+    if first.lower().strip('"\'' ) == "unknown location":
+        return reverse_geocode(lat, lon, city_index)
+
+    
+    try:
+        left, country = _split_country(first)
+        city, county, state = _parse_base(left)
+    except ValueError:
+        logger.info("LLM output failed format guard (%s); using fallback.", first)
+        return reverse_geocode(lat, lon, city_index)
+
+   
+    country = (country or likely_country_code or "US").strip()
+
+  
+    return f"{city}, {county}, {state} — {country}"
+
 
 def save_street_name_to_db(lat: float, lon: float, street_name: str):
     lat_encrypted = encrypt_data(str(lat))
@@ -998,10 +1131,8 @@ def quantum_tensor_earth_radius(lat):
     phi = math.radians(lat)
     term1 = (a**2 * np.cos(phi))**2
     term2 = (b**2 * np.sin(phi))**2
-    radius = np.sqrt(
-        (term1 + term2) / ((a * np.cos(phi))**2 + (b * np.sin(phi))**2))
-    return radius * (1 + 0.000072 * np.sin(2 * phi) +
-                     0.000031 * np.cos(2 * phi))
+    radius = np.sqrt((term1 + term2) / ((a * np.cos(phi))**2 + (b * np.sin(phi))**2))
+    return radius * (1 + 0.000072 * np.sin(2 * phi) + 0.000031 * np.cos(2 * phi))
 
 
 def quantum_haversine_distance(lat1, lon1, lat2, lon2):
@@ -1009,30 +1140,73 @@ def quantum_haversine_distance(lat1, lon1, lat2, lon2):
     phi1, phi2 = map(math.radians, [lat1, lat2])
     dphi = phi2 - phi1
     dlambda = math.radians(lon2 - lon1)
-    a = (np.sin(dphi / 2)**
-         2) + (np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2)**2)
+    a = (np.sin(dphi / 2)**2) + (np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2)**2)
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c * (1 + 0.000045 * np.sin(dphi) * np.cos(dlambda))
 
 
-def reverse_geocode(lat, lon, cities):
+def quantum_haversine_hints(
+    lat: float,
+    lon: float,
+    cities: Dict[str, Dict[str, Any]],
+    top_k: int = 5
+) -> Dict[str, Any]:
+
     if not cities or not isinstance(cities, dict):
-        return "Unknown Location"
-    nearest_city = None
-    min_distance = float('inf')
-    for city in cities.values():
+        return {"top": [], "nearest": None, "unknownish": True, "hint_text": ""}
+
+    rows: List[Tuple[float, Dict[str, Any]]] = []
+    for c in cities.values():
         try:
-            city_lat = float(city['latitude'])
-            city_lon = float(city['longitude'])
-            distance = quantum_haversine_distance(lat, lon, city_lat, city_lon)
-            if distance < min_distance:
-                min_distance = distance
-                nearest_city = city
-        except:
+            clat = float(c["latitude"]); clon = float(c["longitude"])
+            dkm  = float(quantum_haversine_distance(lat, lon, clat, clon))
+            brg  = _initial_bearing(lat, lon, clat, clon)
+            c = dict(c) 
+            c["_distance_km"] = round(dkm, 3)
+            c["_bearing_deg"] = round(brg, 1)
+            c["_bearing_card"] = _bearing_to_cardinal(brg)
+            rows.append((dkm, c))
+        except Exception:
             continue
-    if nearest_city:
-        return f"{nearest_city['name']}, {nearest_city['countrycode']}"
+
+    if not rows:
+        return {"top": [], "nearest": None, "unknownish": True, "hint_text": ""}
+
+    rows.sort(key=lambda t: t[0])
+    top = [r[1] for r in rows[:max(1, top_k)]]
+    nearest = top[0]
+
+    
+    unknownish = nearest["_distance_km"] > 350.0
+
+ 
+    parts = []
+    for i, c in enumerate(top, 1):
+        line = (
+            f"{i}) {_safe_get(c, ['name','city','locality'],'?')}, "
+            f"{_safe_get(c, ['county','admin2','district'],'')}, "
+            f"{_safe_get(c, ['state','region','admin1'],'')} — "
+            f"{_safe_get(c, ['country','countrycode','cc'],'?').upper()} "
+            f"(~{c['_distance_km']} km {c['_bearing_card']})"
+        )
+        parts.append(line)
+
+    hint_text = "\n".join(parts)
+    return {"top": top, "nearest": nearest, "unknownish": unknownish, "hint_text": hint_text}
+
+
+def reverse_geocode(lat: float, lon: float, cities: Dict[str, Any]) -> str:
+    hints = quantum_haversine_hints(lat, lon, cities, top_k=1)
+    nearest = hints["nearest"]
+    if nearest:
+        return _format_locality_line(nearest)
     return "Unknown Location"
+
+def approximate_country(lat: float, lon: float, cities: Dict[str, Any]) -> str:
+    hints = quantum_haversine_hints(lat, lon, cities, top_k=1)
+    if hints["nearest"]:
+        return _safe_get(hints["nearest"], ["countrycode","country","cc"], "UNKNOWN").upper()
+    return "UNKNOWN"
 
 
 def generate_invite_code(length=24, use_checksum=True):
@@ -1633,7 +1807,7 @@ async def run_openai_completion(prompt):
                 }
 
                 payload = {
-                    "model": "gpt-5",      
+                    "model": "gpt-5-mini",      
                     "input": prompt,                
                     "max_output_tokens": 1200,      
                  
@@ -3226,7 +3400,7 @@ def dashboard():
         <div class="stepper">
             <div class="step active" id="stepper1">
                 <div class="circle">1</div>
-                Grab Coordinates
+                Grabs
             </div>
             <div class="step" id="stepper2">
                 <div class="circle">2</div>
