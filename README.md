@@ -30,7 +30,7 @@ Most “detectors” try to say *what is there* right now. QRS leans into **inte
 
 # Why You Should Care (≈500 words total)
 
-Road risk is messy. You rarely have perfect, sensor-grade truth, yet you still need decisions *now*. QRS embraces that reality. It doesn’t pretend to be a police scanner, a traffic feed, or a lidar stack; it’s a **lightweight decision aid** that combines location context, compact probability modeling, and careful prompting to produce **short, practical guidance**.
+Road risk is messy. You rarely have perfect, sensor-grade truth, yet you still need decisions *now*. QRS embraces that reality. It doesn’t pretend to be a radio scanner, a traffic feed, or a lidar stack; it’s a **lightweight decision aid** that combines location context, compact probability modeling, and careful prompting to produce **short and actionable while still practical guidance**.
 
 The upside:
 
