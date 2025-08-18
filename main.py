@@ -136,6 +136,21 @@ def _chaotic_three_fry_mix(buf: bytes) -> bytes:
     return struct.pack('>4Q', *words)
 
 
+
+def validate_password_strength(password):
+    if len(password) < 8:
+        return False
+
+    if not re.search(r"[A-Z]", password):
+        return False
+    if not re.search(r"[a-z]", password):
+        return False
+    if not re.search(r"[0-9]", password):
+        return False
+    if not re.search(r"[@$!%*?&]", password):
+        return False
+    return True
+    
 def generate_very_strong_secret_key():
 
     global _entropy_state
@@ -1200,21 +1215,6 @@ def generate_invite_code(length=24, use_checksum=True):
         invite_code += checksum
 
     return invite_code
-
-
-def validate_password_strength(password):
-    if len(password) < 8:
-        return False
-
-    if not re.search(r"[A-Z]", password):
-        return False
-    if not re.search(r"[a-z]", password):
-        return False
-    if not re.search(r"[0-9]", password):
-        return False
-    if not re.search(r"[@$!%*?&]", password):
-        return False
-    return True
 
 
 def register_user(username, password, invite_code=None):
