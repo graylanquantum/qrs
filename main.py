@@ -97,6 +97,35 @@ if not ADMIN_USERNAME or not ADMIN_PASS:
         "admin_username and/or admin_pass environment variables are not defined! "
         "Set them in your environment before starting the app.")
 
+if 'parse_safe_float' not in globals():
+    def parse_safe_float(val) -> float:
+        """
+        Reject NaN/Inf in any casing/synonym and ensure finiteness.
+        Prevents undefined behavior from float('nan') etc.
+        """
+        s = str(val).strip()
+        bad = {'nan', '+nan', '-nan', 'inf', '+inf', '-inf', 'infinity', '+infinity', '-infinity'}
+        if s.lower() in bad:
+            raise ValueError("Non-finite float not allowed")
+        f = float(s)
+        if not math.isfinite(f):
+            raise ValueError("Non-finite float not allowed")
+        return f
+
+
+if 'IDENTIFIER_RE' not in globals():
+    IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+if 'quote_ident' not in globals():
+    def quote_ident(name: str) -> str:
+        if not isinstance(name, str) or not IDENTIFIER_RE.match(name):
+            raise ValueError(f"Invalid SQL identifier: {name!r}")
+        return '"' + name.replace('"', '""') + '"'
+
+if '_is_safe_condition_sql' not in globals():
+    def _is_safe_condition_sql(cond: str) -> bool:
+       
+        return bool(re.fullmatch(r"[A-Za-z0-9_\s\.\=\>\<\!\?\(\),]*", cond or ""))
 
 def _chaotic_three_fry_mix(buf: bytes) -> bytes:
     import struct
@@ -335,11 +364,43 @@ def decrypt_data(encrypted_data_b64):
         return None
 
 
+def _gen_overwrite_patterns(passes: int):
+    charset = string.ascii_letters + string.digits + string.punctuation
+    patterns = [
+        lambda: ''.join(secrets.choice(charset) for _ in range(64)),
+        lambda: '0' * 64, lambda: '1' * 64,
+        lambda: ''.join(secrets.choice(charset) for _ in range(64)),
+        lambda: 'X' * 64, lambda: 'Y' * 64,
+        lambda: ''.join(secrets.choice(charset) for _ in range(64))
+    ]
+    if passes > len(patterns):
+        patterns = patterns * (passes // len(patterns)) + patterns[:passes % len(patterns)]
+    else:
+        patterns = patterns[:passes]
+    return patterns
+
+def _values_for_types(col_types_ordered: list[tuple[str, str]], pattern_func):
+    vals = []
+    for _, typ in col_types_ordered:
+        t = typ.upper()
+        if t in ("TEXT", "CHAR", "VARCHAR", "CLOB"):
+            vals.append(pattern_func())
+        elif t in ("INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT"):
+            vals.append(secrets.randbits(64) - (2**63))
+        elif t in ("REAL", "DOUBLE", "FLOAT"):
+            vals.append(secrets.randbits(64) / (2**64))
+        elif t == "BLOB":
+            vals.append(secrets.token_bytes(64))
+        elif t == "BOOLEAN":
+            vals.append(secrets.choice([0, 1]))
+        else:
+            vals.append(pattern_func())
+    return vals
+
 
 dev = qml.device("default.qubit", wires=5)
 
 registration_enabled = True
-
 def create_tables():
     if not DB_FILE.exists():
         DB_FILE.touch(mode=0o600)
@@ -384,24 +445,29 @@ def create_tables():
             )
         """)
 
-        cursor.execute(
-            "SELECT value FROM config WHERE key = 'registration_enabled'")
+        cursor.execute("SELECT value FROM config WHERE key = 'registration_enabled'")
         if not cursor.fetchone():
             cursor.execute("INSERT INTO config (key, value) VALUES (?, ?)",
                            ('registration_enabled', '1'))
 
         cursor.execute("PRAGMA table_info(hazard_reports)")
-        existing_columns = {info[1] for info in cursor.fetchall()}
-        required_columns = [
-            "latitude", "longitude", "street_name", "vehicle_type",
-            "destination", "result", "cpu_usage", "ram_usage",
-            "quantum_results", "risk_level", "model_used"
-        ]
-        for column in required_columns:
-            if column not in existing_columns:
-                # validate + quote identifier to avoid dynamic SQL injection
-                qcol = quote_ident(column)
-                cursor.execute(f"ALTER TABLE hazard_reports ADD COLUMN {qcol} TEXT")
+        existing = {row[1] for row in cursor.fetchall()}
+        alter_map = {
+            "latitude":       "ALTER TABLE hazard_reports ADD COLUMN latitude TEXT",
+            "longitude":      "ALTER TABLE hazard_reports ADD COLUMN longitude TEXT",
+            "street_name":    "ALTER TABLE hazard_reports ADD COLUMN street_name TEXT",
+            "vehicle_type":   "ALTER TABLE hazard_reports ADD COLUMN vehicle_type TEXT",
+            "destination":    "ALTER TABLE hazard_reports ADD COLUMN destination TEXT",
+            "result":         "ALTER TABLE hazard_reports ADD COLUMN result TEXT",
+            "cpu_usage":      "ALTER TABLE hazard_reports ADD COLUMN cpu_usage TEXT",
+            "ram_usage":      "ALTER TABLE hazard_reports ADD COLUMN ram_usage TEXT",
+            "quantum_results":"ALTER TABLE hazard_reports ADD COLUMN quantum_results TEXT",
+            "risk_level":     "ALTER TABLE hazard_reports ADD COLUMN risk_level TEXT",
+            "model_used":     "ALTER TABLE hazard_reports ADD COLUMN model_used TEXT",
+        }
+        for col, alter_sql in alter_map.items():
+            if col not in existing:
+                cursor.execute(alter_sql)
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS rate_limits (
@@ -434,7 +500,71 @@ def create_tables():
     print("Database tables created and verified successfully.")
 
 
+def overwrite_hazard_reports_by_timestamp(cursor, expiration_str: str, passes: int = 7):
+    col_types = [
+        ("latitude","TEXT"), ("longitude","TEXT"), ("street_name","TEXT"),
+        ("vehicle_type","TEXT"), ("destination","TEXT"), ("result","TEXT"),
+        ("cpu_usage","TEXT"), ("ram_usage","TEXT"),
+        ("quantum_results","TEXT"), ("risk_level","TEXT"),
+    ]
+    sql = (
+        "UPDATE hazard_reports SET "
+        "latitude=?, longitude=?, street_name=?, vehicle_type=?, destination=?, result=?, "
+        "cpu_usage=?, ram_usage=?, quantum_results=?, risk_level=? "
+        "WHERE timestamp <= ?"
+    )
+    for i, pattern in enumerate(_gen_overwrite_patterns(passes), start=1):
+        vals = _values_for_types(col_types, pattern)
+        cursor.execute(sql, (*vals, expiration_str))
+        logger.debug("Pass %d complete for hazard_reports (timestamp<=).", i)
 
+def overwrite_entropy_logs_by_timestamp(cursor, expiration_str: str, passes: int = 7):
+    col_types = [("log","TEXT"), ("pass_num","INTEGER")]
+
+    sql = "UPDATE entropy_logs SET log=?, pass_num=? WHERE timestamp <= ?"
+    for i, pattern in enumerate(_gen_overwrite_patterns(passes), start=1):
+        vals = _values_for_types(col_types, pattern)
+        cursor.execute(sql, (*vals, expiration_str))
+        logger.debug("Pass %d complete for entropy_logs (timestamp<=).", i)
+
+def overwrite_hazard_reports_by_user(cursor, user_id: int, passes: int = 7):
+    col_types = [
+        ("latitude","TEXT"), ("longitude","TEXT"), ("street_name","TEXT"),
+        ("vehicle_type","TEXT"), ("destination","TEXT"), ("result","TEXT"),
+        ("cpu_usage","TEXT"), ("ram_usage","TEXT"),
+        ("quantum_results","TEXT"), ("risk_level","TEXT"),
+    ]
+    sql = (
+        "UPDATE hazard_reports SET "
+        "latitude=?, longitude=?, street_name=?, vehicle_type=?, destination=?, result=?, "
+        "cpu_usage=?, ram_usage=?, quantum_results=?, risk_level=? "
+        "WHERE user_id = ?"
+    )
+    for i, pattern in enumerate(_gen_overwrite_patterns(passes), start=1):
+        vals = _values_for_types(col_types, pattern)
+        cursor.execute(sql, (*vals, user_id))
+        logger.debug("Pass %d complete for hazard_reports (user_id).", i)
+
+def overwrite_rate_limits_by_user(cursor, user_id: int, passes: int = 7):
+    col_types = [("request_count","INTEGER"), ("last_request_time","TEXT")]
+    sql = "UPDATE rate_limits SET request_count=?, last_request_time=? WHERE user_id = ?"
+    for i, pattern in enumerate(_gen_overwrite_patterns(passes), start=1):
+        vals = _values_for_types(col_types, pattern)
+        cursor.execute(sql, (*vals, user_id))
+        logger.debug("Pass %d complete for rate_limits (user_id).", i)
+
+
+def overwrite_entropy_logs_by_passnum(cursor, pass_num: int, passes: int = 7):
+
+    col_types = [("log","TEXT"), ("pass_num","INTEGER")]
+    sql = (
+        "UPDATE entropy_logs SET log=?, pass_num=? "
+        "WHERE id IN (SELECT id FROM entropy_logs WHERE pass_num = ?)"
+    )
+    for i, pattern in enumerate(_gen_overwrite_patterns(passes), start=1):
+        vals = _values_for_types(col_types, pattern)
+        cursor.execute(sql, (*vals, pass_num))
+        logger.debug("Pass %d complete for entropy_logs (pass_num).", i)
 def _dynamic_argon2_hasher():
 
     try:
@@ -614,107 +744,6 @@ def collect_entropy(sources=None) -> int:
         str, entropy_pool)).encode()).digest()
     return int.from_bytes(combined_entropy, 'big') % 2**512
 
-def secure_overwrite(cursor,
-                     table_name,
-                     columns,
-                     condition,
-                     condition_params=None,
-                     passes=7):
-
-    def is_valid_identifier(identifier):
-        return re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', identifier) is not None
-
-    try:
-        if not is_valid_identifier(table_name):
-            raise ValueError(f"Invalid table name: {table_name}")
-
-        for col in columns.keys():
-            if not is_valid_identifier(col):
-                raise ValueError(f"Invalid column name: {col}")
-
-        logger.info(
-            f"Starting secure overwrite for table '{table_name}' with {passes} passes."
-        )
-
-        charset = string.ascii_letters + string.digits + string.punctuation
-
-        patterns = [
-            lambda: ''.join(secrets.choice(charset) for _ in range(64)),
-            lambda: '0' * 64, lambda: '1' * 64,
-            lambda: ''.join(secrets.choice(charset) for _ in range(64)),
-            lambda: 'X' * 64, lambda: 'Y' * 64,
-            lambda: ''.join(secrets.choice(charset) for _ in range(64))
-        ]
-
-        if passes > len(patterns):
-            logger.warning(
-                f"Requested {passes} passes exceeds available patterns. Repeating patterns."
-            )
-            patterns = patterns * (
-                passes // len(patterns)) + patterns[:passes % len(patterns)]
-        else:
-            patterns = patterns[:passes]
-
-        quoted_table = f'"{table_name}"'
-        quoted_columns = {col: f'"{col}"' for col in columns.keys()}
-
-        # WHERE template must be simple/parameterized
-        if not _is_safe_condition_sql(condition):
-            raise RuntimeError("Unsafe characters detected in WHERE clause template.")
-        if condition_params is None and '?' in condition:
-            raise RuntimeError("Condition uses placeholders but no condition_params were provided.")
-
-        for pass_num, pattern_func in enumerate(patterns, start=1):
-            overwrite_values = {}
-            for col, col_type in columns.items():
-                col_type_upper = col_type.upper()
-                if col_type_upper in ["TEXT", "CHAR", "VARCHAR", "CLOB"]:
-                    overwrite_values[col] = pattern_func()
-                elif col_type_upper in [
-                        "INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT"
-                ]:
-                    overwrite_values[col] = secrets.randbits(64) - (2**63)
-                elif col_type_upper in ["REAL", "DOUBLE", "FLOAT"]:
-                    overwrite_values[col] = secrets.randbits(64) / (2**64)
-                elif col_type_upper in ["BLOB"]:
-                    overwrite_values[col] = secrets.token_bytes(64)
-                elif col_type_upper in ["BOOLEAN"]:
-                    overwrite_values[col] = secrets.choice([0, 1])
-                else:
-                    overwrite_values[col] = pattern_func()
-
-            set_clause = ', '.join([
-                f"{quoted_columns[col]} = ?"
-                for col in overwrite_values.keys()
-            ])
-            query = f"UPDATE {quoted_table} SET {set_clause} WHERE {condition}"
-            params = list(overwrite_values.values())
-            if condition_params:
-                params.extend(condition_params)
-
-            cursor.execute(query, params)
-            logger.debug(f"Pass {pass_num} complete for table '{table_name}'.")
-
-        logger.info(
-            f"Secure overwrite completed for table '{table_name}' with {passes} passes."
-        )
-
-    except ValueError as ve:
-        logger.error(
-            f"Validation error during secure overwrite for table '{table_name}': {ve}"
-        )
-        raise RuntimeError("Invalid table or column name provided.")
-    except sqlite3.Error as sqle:
-        logger.error(
-            f"SQLite error during secure overwrite for table '{table_name}': {sqle}",
-            exc_info=True)
-        raise RuntimeError("Database error occurred during secure overwrite.")
-    except Exception as e:
-        logger.error(
-            f"Unexpected error during secure overwrite for table '{table_name}': {e}",
-            exc_info=True)
-        raise RuntimeError(
-            "An unexpected error occurred during secure overwrite.")
 
 
 
@@ -734,7 +763,6 @@ def fetch_entropy_logs():
 
     return decrypted_logs
 
-
 def delete_expired_data():
     while True:
         now = datetime.now()
@@ -747,6 +775,7 @@ def delete_expired_data():
 
                 db.execute("BEGIN")
 
+         
                 cursor.execute("PRAGMA table_info(hazard_reports)")
                 hazard_columns = {info[1] for info in cursor.fetchall()}
                 if all(col in hazard_columns for col in [
@@ -756,27 +785,13 @@ def delete_expired_data():
                 ]):
                     cursor.execute(
                         "SELECT id FROM hazard_reports WHERE timestamp <= ?",
-                        (expiration_str, ))
+                        (expiration_str,))
                     expired_hazard_ids = [row[0] for row in cursor.fetchall()]
 
-                    secure_overwrite(cursor,
-                                     "hazard_reports", {
-                                         "latitude": "TEXT",
-                                         "longitude": "TEXT",
-                                         "street_name": "TEXT",
-                                         "vehicle_type": "TEXT",
-                                         "destination": "TEXT",
-                                         "result": "TEXT",
-                                         "cpu_usage": "TEXT",
-                                         "ram_usage": "TEXT",
-                                         "quantum_results": "TEXT",
-                                         "risk_level": "TEXT"
-                                     },
-                                     "timestamp <= ?",
-                                     condition_params=[expiration_str])
+                    overwrite_hazard_reports_by_timestamp(cursor, expiration_str, passes=7)
                     cursor.execute(
                         "DELETE FROM hazard_reports WHERE timestamp <= ?",
-                        (expiration_str, ))
+                        (expiration_str,))
                     logger.info(
                         f"Deleted expired hazard_reports IDs: {expired_hazard_ids}"
                     )
@@ -784,25 +799,19 @@ def delete_expired_data():
                     logger.warning(
                         "Skipping hazard_reports: Missing required columns.")
 
+             
                 cursor.execute("PRAGMA table_info(entropy_logs)")
                 entropy_columns = {info[1] for info in cursor.fetchall()}
-                if all(col in entropy_columns
-                       for col in ["id", "log", "pass_num", "timestamp"]):
+                if all(col in entropy_columns for col in ["id", "log", "pass_num", "timestamp"]):
                     cursor.execute(
                         "SELECT id FROM entropy_logs WHERE timestamp <= ?",
-                        (expiration_str, ))
+                        (expiration_str,))
                     expired_entropy_ids = [row[0] for row in cursor.fetchall()]
 
-                    secure_overwrite(cursor,
-                                     "entropy_logs", {
-                                         "log": "TEXT",
-                                         "pass_num": "INTEGER"
-                                     },
-                                     "timestamp <= ?",
-                                     condition_params=[expiration_str])
+                    overwrite_entropy_logs_by_timestamp(cursor, expiration_str, passes=7)
                     cursor.execute(
                         "DELETE FROM entropy_logs WHERE timestamp <= ?",
-                        (expiration_str, ))
+                        (expiration_str,))
                     logger.info(
                         f"Deleted expired entropy_logs IDs: {expired_entropy_ids}"
                     )
@@ -817,9 +826,7 @@ def delete_expired_data():
                     cursor = db.cursor()
                     for _ in range(3):
                         cursor.execute("VACUUM")
-                logger.info(
-                    "Database triple VACUUM completed with sector randomization."
-                )
+                logger.info("Database triple VACUUM completed with sector randomization.")
             except sqlite3.OperationalError as e:
                 logger.error(f"VACUUM failed: {e}", exc_info=True)
 
@@ -829,50 +836,23 @@ def delete_expired_data():
         interval = random.randint(5400, 10800)
         time.sleep(interval)
 
-
 def delete_user_data(user_id):
     try:
         with sqlite3.connect(DB_FILE) as db:
             cursor = db.cursor()
             db.execute("BEGIN")
 
-            secure_overwrite(
-                cursor, "hazard_reports", {
-                    "latitude": "TEXT",
-                    "longitude": "TEXT",
-                    "street_name": "TEXT",
-                    "vehicle_type": "TEXT",
-                    "destination": "TEXT",
-                    "result": "TEXT",
-                    "cpu_usage": "TEXT",
-                    "ram_usage": "TEXT",
-                    "quantum_results": "TEXT",
-                    "risk_level": "TEXT"
-                },
-                "user_id = ?",
-                condition_params=[user_id]
-            )
-            cursor.execute("DELETE FROM hazard_reports WHERE user_id = ?",
-                           (user_id, ))
+            
+            overwrite_hazard_reports_by_user(cursor, user_id, passes=7)
+            cursor.execute("DELETE FROM hazard_reports WHERE user_id = ?", (user_id, ))
 
-            secure_overwrite(cursor, "rate_limits", {
-                "request_count": "INTEGER",
-                "last_request_time": "TEXT"
-            }, "user_id = ?", condition_params=[user_id])
-            cursor.execute("DELETE FROM rate_limits WHERE user_id = ?",
-                           (user_id, ))
+      
+            overwrite_rate_limits_by_user(cursor, user_id, passes=7)
+            cursor.execute("DELETE FROM rate_limits WHERE user_id = ?", (user_id, ))
 
-            secure_overwrite(
-                cursor,
-                "entropy_logs", {
-                    "pass_num": "INTEGER",
-                    "log": "TEXT"
-                },
-                "id IN (SELECT id FROM entropy_logs WHERE pass_num = ?)",
-                condition_params=[user_id]
-            )
-            cursor.execute("DELETE FROM entropy_logs WHERE pass_num = ?",
-                           (user_id, ))
+            
+            overwrite_entropy_logs_by_passnum(cursor, user_id, passes=7)
+            cursor.execute("DELETE FROM entropy_logs WHERE pass_num = ?", (user_id, ))
 
             db.commit()
             logger.info(f"Securely deleted all data for user_id {user_id}")
@@ -887,7 +867,6 @@ def delete_user_data(user_id):
         logger.error(
             f"Failed to securely delete data for user_id {user_id}: {e}",
             exc_info=True)
-
 
 data_deletion_thread = threading.Thread(target=delete_expired_data,
                                         daemon=True)
@@ -1582,71 +1561,62 @@ async def run_openai_completion(prompt):
     url = "https://api.openai.com/v1/responses"
 
     async def _extract_text_from_responses(payload: dict) -> Union[str, None]:
-        """
-        Robust extraction for Responses API outputs.
-        Tries several common shapes:
-          - payload['text']
-          - payload['output'][*]['content'][*]['text'|'parts']
-          - payload['output'][*] plain strings
-          - payload['choices'] fallbacks (chat/completions style)
-        Returns the first reasonable concatenated string or None.
-        """
-        # quick text field
+
         if isinstance(payload.get("text"), str) and payload["text"].strip():
             return payload["text"].strip()
 
-        # 'output' style (Responses API)
+
         out = payload.get("output")
         if isinstance(out, list) and out:
             parts = []
             for item in out:
-                # if item is a string, accept it
+
                 if isinstance(item, str) and item.strip():
                     parts.append(item.strip())
                     continue
                 if not isinstance(item, dict):
                     continue
-                # many Responses API outputs have a 'content' list
+
                 content = item.get("content") or item.get("contents") or item.get("data") or []
                 if isinstance(content, list):
                     for c in content:
                         if isinstance(c, str) and c.strip():
                             parts.append(c.strip())
                         elif isinstance(c, dict):
-                            # some shapes: {'type':'output_text','text': '...'}
+
                             if "text" in c and isinstance(c["text"], str) and c["text"].strip():
                                 parts.append(c["text"].strip())
-                            # {'type':'output_text','parts':['a','b']}
+                         
                             elif "parts" in c and isinstance(c["parts"], list):
                                 for p in c["parts"]:
                                     if isinstance(p, str) and p.strip():
                                         parts.append(p.strip())
-                # older shape: item.get('text')
+
                 if isinstance(item.get("text"), str) and item["text"].strip():
                     parts.append(item["text"].strip())
             if parts:
                 return "\n\n".join(parts)
 
-        # fallback to choices (chat/completions style)
+
         choices = payload.get("choices")
         if isinstance(choices, list) and choices:
             for ch in choices:
                 if isinstance(ch, dict):
-                    # chat completions style
+ 
                     message = ch.get("message") or ch.get("delta")
                     if isinstance(message, dict):
-                        # message content might be string or list
+     
                         content = message.get("content")
                         if isinstance(content, str) and content.strip():
                             return content.strip()
                         if isinstance(content, list):
-                            # sometimes content is a list of dicts
+                  
                             for c in content:
                                 if isinstance(c, str) and c.strip():
                                     return c.strip()
                                 if isinstance(c, dict) and isinstance(c.get("text"), str) and c["text"].strip():
                                     return c["text"].strip()
-                    # older 'text' key
+              
                     if isinstance(ch.get("text"), str) and ch["text"].strip():
                         return ch["text"].strip()
 
@@ -1663,37 +1633,37 @@ async def run_openai_completion(prompt):
                 }
 
                 payload = {
-                    "model": "gpt-5",               # target GPT-5
-                    "input": prompt,                # Responses API prefers 'input'
-                    "max_output_tokens": 1200,       # adjust as needed
-                    # request minimal reasoning effort (correct nested form)
+                    "model": "gpt-5",      
+                    "input": prompt,                
+                    "max_output_tokens": 1200,      
+                 
                     "reasoning": {"effort": "minimal"},
-                    # do NOT include unsupported params like temperature/modalities here
+                
                 }
 
                 response = await client.post(url, json=payload, headers=headers)
-                # if server responds non-2xx, raise to trigger retry/logging
+               
                 response.raise_for_status()
 
                 data = response.json()
 
-                # try to extract text robustly
+            
                 reply = await _extract_text_from_responses(data)
                 if reply:
                     logger.info("run_openai_completion succeeded on attempt %d.", attempt)
                     return reply.strip()
                 else:
-                    # 200 but no usable text; log available keys for debugging
+                    
                     logger.error(
                         "Responses API returned 200 but no usable text. Keys: %s",
                         list(data.keys())
                     )
-                    # fall through to retry logic (subject to attempts left)
+                   
 
             except (httpx.TimeoutException, httpx.ConnectTimeout) as e:
                 logger.error("Attempt %d failed due to timeout: %s", attempt, e, exc_info=True)
             except httpx.HTTPStatusError as e:
-                # log body + status for 4xx/5xx responses to help debug parameter issues
+              
                 body_text = None
                 try:
                     body_text = e.response.json()
