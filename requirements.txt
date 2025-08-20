@@ -1,7 +1,6 @@
 flask[async]==3.0.3
 cryptography==3.4.8
 httpx==0.27.0
-numpy==1.24.0
 pennylane==0.35.1
 psutil==6.0.0
 waitress==3.0.0
@@ -13,3 +12,7 @@ WTForms==3.1.2
 geonamescache==2.0.0
 backoff==1.10.0
 pathlib==1.0.1
+coinbase-advanced-py==1.8.2
+argon2
+coinbase
+numpy

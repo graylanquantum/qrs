@@ -51,6 +51,18 @@ from cryptography.hazmat.primitives.hashes import SHA3_512
 from argon2.low_level import hash_secret_raw, Type as ArgonType
 from numpy.random import Generator, PCG64DXSM
 import itertools
+from datetime import timezone
+import asyncio
+import logging
+from coinbase.rest import RESTClient
+from coinbase import jwt_generator
+
+CB_API_KEY = os.getenv("COINBASE_API_KEY")
+CB_API_SECRET = os.getenv("COINBASE_API_SECRET")
+
+CB_BASE = "https://api.coinbase.com"
+CB_EXCHANGE = "https://api.exchange.coinbase.com"
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -184,7 +196,7 @@ def generate_very_strong_secret_key():
     hkdf = HKDF(algorithm=SHA3_512(),
                 length=32,
                 salt=os.urandom(32),
-                info=b"QRS|rotating-session-key|v4",
+                info=b"QCS|rotating-session-key|v4",
                 backend=default_backend())
     final_key = hkdf.derive(raw)
 
@@ -715,25 +727,33 @@ def create_database_connection():
     db_connection.execute("PRAGMA journal_mode=WAL;")
     return db_connection
 
+@backoff.on_exception(backoff.expo, (httpx.RequestError, httpx.TimeoutException), max_tries=3, jitter=None)
+async def _get_json_async(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: float = 20.0) -> dict:
+    """Lightweight async GET -> JSON with retries."""
+    async with httpx.AsyncClient(timeout=timeout, headers=headers or {"User-Agent": "QCS/1.0"}) as client:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        return resp.json()
 
-def collect_entropy(sources=None) -> int:
-    if sources is None:
-        sources = {
-            "os_random":
-            lambda: int.from_bytes(secrets.token_bytes(32), 'big'),
-            "system_metrics":
-            lambda: int(
-                hashlib.sha512(f"{os.getpid()}{os.getppid()}{time.time_ns()}".
-                               encode()).hexdigest(), 16),
-            "hardware_random":
-            lambda: int.from_bytes(os.urandom(32), 'big') ^ secrets.randbits(
-                256),
-        }
-    entropy_pool = [source() for source in sources.values()]
-    combined_entropy = hashlib.sha512("".join(map(
-        str, entropy_pool)).encode()).digest()
-    return int.from_bytes(combined_entropy, 'big') % 2**512
 
+
+_cb = RESTClient()  
+
+def _norm(x):
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
+
+async def _cb_get(path: str, params: Dict[str, Any] | None = None):
+
+    return await asyncio.to_thread(_cb.get, path, params=params or {})
+
+async def _httpx_get_json(url: str, *, params: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 6.0):
+    async with httpx.AsyncClient(timeout=timeout, http2=True, headers={"Accept": "application/json", **(headers or {})}) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
 
 def fetch_entropy_logs():
     with sqlite3.connect(DB_FILE) as db:
@@ -863,222 +883,68 @@ data_deletion_thread = threading.Thread(target=delete_expired_data,
                                         daemon=True)
 data_deletion_thread.start()
 
-
 def sanitize_input(user_input):
     if not isinstance(user_input, str):
         user_input = str(user_input)
     return bleach.clean(user_input)
 
-
 gc = geonamescache.GeonamesCache()
 cities = gc.get_cities()
 
-
-def _safe_get(d: Dict[str, Any], keys: List[str], default: str = "") -> str:
-    for k in keys:
-        v = d.get(k)
-        if v is not None and v != "":
-            return str(v)
-    return default
-
-
-def _initial_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    φ1, φ2 = map(math.radians, [lat1, lat2])
-    Δλ = math.radians(lon2 - lon1)
-    y = math.sin(Δλ) * math.cos(φ2)
-    x = math.cos(φ1) * math.sin(φ2) - math.sin(φ1) * math.cos(φ2) * math.cos(Δλ)
-    θ = math.degrees(math.atan2(y, x))
-    return (θ + 360.0) % 360.0
-
-
-def _bearing_to_cardinal(bearing: float) -> str:
-    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
-            "S","SSW","SW","WSW","W","WNW","NW","NNW"]
-    idx = int((bearing + 11.25) // 22.5) % 16
-    return dirs[idx]
-
-
-def _format_locality_line(city: Dict[str, Any]) -> str:
-
-    name   = _safe_get(city, ["name", "city", "locality"], "Unknown")
-    county = _safe_get(city, ["county", "admin2", "district"], "")
-    state  = _safe_get(city, ["state", "region", "admin1"], "")
-    country= _safe_get(city, ["country", "countrycode", "cc"], "UNKNOWN")
-
-    country = country.upper() if len(country) <= 3 else country
-    return f"{name}, {county}, {state} — {country}"
-
-
-def _finite_f(v: Any) -> Optional[float]:
-    try:
-        f = float(v)
-        return f if math.isfinite(f) else None
-    except (TypeError, ValueError):
-        return None
-        
-
-def approximate_nearest_city(
-    lat: float,
-    lon: float,
-    cities: Dict[str, Dict[str, Any]],
-) -> Tuple[Optional[Dict[str, Any]], float]:
-
-
-    if not (math.isfinite(lat) and -90.0 <= lat <= 90.0 and
-            math.isfinite(lon) and -180.0 <= lon <= 180.0):
-        raise ValueError(f"Invalid coordinates lat={lat}, lon={lon}")
-
-    nearest_city: Optional[Dict[str, Any]] = None
-    min_distance = float("inf")
-
-    for key, city in (cities or {}).items():
- 
-        if not isinstance(city, dict):
-            continue
-
-        lat_raw = city.get("latitude")
-        lon_raw = city.get("longitude")
-
-        city_lat = _finite_f(lat_raw)
-        city_lon = _finite_f(lon_raw)
-        if city_lat is None or city_lon is None:
-           
-            continue
-
+def approximate_nearest_city(lat, lon, cities):
+    nearest_city = None
+    min_distance = float('inf')
+    for city in cities.values():
         try:
+            city_lat = float(city['latitude'])
+            city_lon = float(city['longitude'])
             distance = quantum_haversine_distance(lat, lon, city_lat, city_lon)
-        except (TypeError, ValueError) as e:
-   
+            if distance < min_distance:
+                min_distance = distance
+                nearest_city = city
+        except:
             continue
-
-        if distance < min_distance:
-            min_distance = distance
-            nearest_city = city
-
     return nearest_city, min_distance
 
+def approximate_country(lat, lon, cities):
+    city, _ = approximate_nearest_city(lat, lon, cities)
+    if city:
+        return city.get('countrycode', 'UNKNOWN')
+    return 'UNKNOWN'
 
-CityMap = Dict[str, Any]
+async def fetch_street_name_llm(lat: float, lon: float) -> str:
+    """
+    Reverse-geocode via OpenAI only, with a simple fallback to local city lookup.
+    """
 
-
-def _coerce_city_index(cities_opt: Optional[Mapping[str, Any]]) -> CityMap:
-    if cities_opt is not None:
-        return {str(k): v for k, v in cities_opt.items()}
-    gc = globals().get("cities")
-    if isinstance(gc, Mapping):
-        return {str(k): v for k, v in gc.items()}
-    return {}
-
-
-def _coords_valid(lat: float, lon: float) -> bool:
-    return math.isfinite(lat) and -90 <= lat <= 90 and math.isfinite(lon) and -180 <= lon <= 180
-
-
-_BASE_FMT = re.compile(r'^\s*"?(?P<city>[^,"\n]+)"?\s*,\s*"?(?P<county>[^,"\n]*)"?\s*,\s*"?(?P<state>[^,"\n]+)"?\s*$')
-
-
-def _split_country(line: str) -> Tuple[str, str]:
-
-    m = re.search(r'\s+[—-]\s+(?P<country>[^"\n]+)\s*$', line)
-    if not m:
-        return line.strip(), ""
-    return line[:m.start()].strip(), m.group("country").strip().strip('"')
-
-
-def _parse_base(left: str) -> Tuple[str, str, str]:
-    m = _BASE_FMT.match(left)
-    if not m:
-        raise ValueError("format mismatch")
-    city   = m.group("city").strip().strip('"')
-    county = m.group("county").strip().strip('"')
-    state  = m.group("state").strip().strip('"')
-    return city, county, state
-
-
-def _first_line_stripped(text: str) -> str:
-    return (text or "").splitlines()[0].strip()
-
-
-async def fetch_street_name_llm(
-    lat: float,
-    lon: float,
-    cities: Optional[Mapping[str, Any]] = None,
-) -> str:
-    city_index: CityMap = _coerce_city_index(cities)
-
-    if not os.getenv("OPENAI_API_KEY"):
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
         logger.error("OPENAI_API_KEY is missing. Falling back to local reverse_geocode.")
-        return reverse_geocode(lat, lon, city_index)
-
-    if not _coords_valid(lat, lon):
-        logger.error("Invalid coordinates lat=%s lon=%s. Falling back.", lat, lon)
-        return reverse_geocode(lat, lon, city_index)
+        return reverse_geocode(lat, lon, cities)
 
     try:
-        likely_country_code = approximate_country(lat, lon, city_index)  
-        nearest_city, distance_to_city = approximate_nearest_city(lat, lon, city_index)
-        city_hint = nearest_city.get("name", "Unknown") if nearest_city else "Unknown"
-        distance_hint = f"{distance_to_city:.2f} km from {city_hint}" if nearest_city else "Unknown"
-
         cpu, ram = get_cpu_ram_usage()
-        quantum_results = quantum_hazard_scan(cpu, ram)
-        quantum_state_str = str(quantum_results)
+        qres = quantum_hazard_scan(cpu, ram)
+        ctx = f"Nearest city heuristic disabled—using OpenAI only.\nQuantum state: {qres}"
+        prompt = (
+            "[action]You are a precision reverse-geocoder. "
+            "Given coordinates, return \"City, County, State\" or \"Unknown Location\".[/action]\n"
+            f"[coords]Latitude: {lat}, Longitude: {lon}[/coords]\n"
+            f"[context]{ctx}[/context]\n"
+            "[format]City, County, State[/format]"
+        )
 
-     
-        llm_prompt = f"""
-[action]You are an Advanced Hypertime Nanobot Reverse-Geocoder with quantum synergy. 
-Determine the most precise City, County, and State based on the provided coordinates 
-using quantum data, known city proximity, and any country/regional hints. 
-Discard uncertain data below 98% reliability.[/action]
+        result = await run_openai_completion(prompt)
+        if not result or "unknown" in result.lower():
+            logger.info("OpenAI returned unknown; using local fallback.")
+            return reverse_geocode(lat, lon, cities)
 
-[coordinates]
-Latitude: {lat}
-Longitude: {lon}
-[/coordinates]
-
-[local_context]
-Nearest known city (heuristic): {city_hint}
-Distance to city: {distance_hint}
-Likely country code: {likely_country_code}
-Quantum state data: {quantum_state_str}
-[/local_context]
-
-[request_format]
-"City, County, State"
-or 
-"Unknown Location"
-[/request_format]
-""".strip()
-
-        result = await run_openai_completion(llm_prompt)
+        clean = bleach.clean(result.strip(), tags=[], strip=True)
+        return clean
 
     except Exception as e:
-        logger.error("Context/prep failed: %s", e, exc_info=True)
-        return reverse_geocode(lat, lon, city_index)
-
-    if not result:
-        logger.info("Empty OpenAI result; using fallback.")
-        return reverse_geocode(lat, lon, city_index)
-
-    clean = bleach.clean(result.strip(), tags=[], strip=True)
-    first = _first_line_stripped(clean)
-
- 
-    if first.lower().strip('"\'' ) == "unknown location":
-        return reverse_geocode(lat, lon, city_index)
-
-    
-    try:
-        left, country = _split_country(first)
-        city, county, state = _parse_base(left)
-    except ValueError:
-        logger.info("LLM output failed format guard (%s); using fallback.", first)
-        return reverse_geocode(lat, lon, city_index)
-
-    country = (country or likely_country_code or "US").strip()
-
-    return f"{city}, {county}, {state} — {country}"
-
+        logger.error("OpenAI geocoding failed: %s", e, exc_info=True)
+        return reverse_geocode(lat, lon, cities)
 
 def save_street_name_to_db(lat: float, lon: float, street_name: str):
     lat_encrypted = encrypt_data(str(lat))
@@ -1087,8 +953,7 @@ def save_street_name_to_db(lat: float, lon: float, street_name: str):
     try:
         with sqlite3.connect(DB_FILE) as db:
             cursor = db.cursor()
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT id
                 FROM hazard_reports
                 WHERE latitude=? AND longitude=?
@@ -1096,18 +961,14 @@ def save_street_name_to_db(lat: float, lon: float, street_name: str):
             existing_record = cursor.fetchone()
 
             if existing_record:
-                cursor.execute(
-                    """
+                cursor.execute("""
                     UPDATE hazard_reports
                     SET street_name=?
                     WHERE id=?
                 """, (street_name_encrypted, existing_record[0]))
-                logger.info(
-                    f"Updated record {existing_record[0]} with street name {street_name}."
-                )
+                logger.info(f"Updated record {existing_record[0]} with street name {street_name}.")
             else:
-                cursor.execute(
-                    """
+                cursor.execute("""
                     INSERT INTO hazard_reports (latitude, longitude, street_name)
                     VALUES (?, ?, ?)
                 """, (lat_encrypted, lon_encrypted, street_name_encrypted))
@@ -1119,7 +980,6 @@ def save_street_name_to_db(lat: float, lon: float, street_name: str):
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
 
-
 def quantum_tensor_earth_radius(lat):
     a = 6378.137821
     b = 6356.751904
@@ -1128,7 +988,6 @@ def quantum_tensor_earth_radius(lat):
     term2 = (b**2 * np.sin(phi))**2
     radius = np.sqrt((term1 + term2) / ((a * np.cos(phi))**2 + (b * np.sin(phi))**2))
     return radius * (1 + 0.000072 * np.sin(2 * phi) + 0.000031 * np.cos(2 * phi))
-
 
 def quantum_haversine_distance(lat1, lon1, lat2, lon2):
     R = quantum_tensor_earth_radius((lat1 + lat2) / 2.0)
@@ -1139,68 +998,24 @@ def quantum_haversine_distance(lat1, lon1, lat2, lon2):
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c * (1 + 0.000045 * np.sin(dphi) * np.cos(dlambda))
 
-
-def quantum_haversine_hints(
-    lat: float,
-    lon: float,
-    cities: Dict[str, Dict[str, Any]],
-    top_k: int = 5
-) -> Dict[str, Any]:
-
+def reverse_geocode(lat, lon, cities):
     if not cities or not isinstance(cities, dict):
-        return {"top": [], "nearest": None, "unknownish": True, "hint_text": ""}
-
-    rows: List[Tuple[float, Dict[str, Any]]] = []
-    for c in cities.values():
+        return "Unknown Location"
+    nearest_city = None
+    min_distance = float('inf')
+    for city in cities.values():
         try:
-            clat = float(c["latitude"]); clon = float(c["longitude"])
-            dkm  = float(quantum_haversine_distance(lat, lon, clat, clon))
-            brg  = _initial_bearing(lat, lon, clat, clon)
-            c = dict(c) 
-            c["_distance_km"] = round(dkm, 3)
-            c["_bearing_deg"] = round(brg, 1)
-            c["_bearing_card"] = _bearing_to_cardinal(brg)
-            rows.append((dkm, c))
-        except Exception:
+            city_lat = float(city['latitude'])
+            city_lon = float(city['longitude'])
+            distance = quantum_haversine_distance(lat, lon, city_lat, city_lon)
+            if distance < min_distance:
+                min_distance = distance
+                nearest_city = city
+        except:
             continue
-
-    if not rows:
-        return {"top": [], "nearest": None, "unknownish": True, "hint_text": ""}
-
-    rows.sort(key=lambda t: t[0])
-    top = [r[1] for r in rows[:max(1, top_k)]]
-    nearest = top[0]
-
-    unknownish = nearest["_distance_km"] > 350.0
-
-    parts = []
-    for i, c in enumerate(top, 1):
-        line = (
-            f"{i}) {_safe_get(c, ['name','city','locality'],'?')}, "
-            f"{_safe_get(c, ['county','admin2','district'],'')}, "
-            f"{_safe_get(c, ['state','region','admin1'],'')} — "
-            f"{_safe_get(c, ['country','countrycode','cc'],'?').upper()} "
-            f"(~{c['_distance_km']} km {c['_bearing_card']})"
-        )
-        parts.append(line)
-
-    hint_text = "\n".join(parts)
-    return {"top": top, "nearest": nearest, "unknownish": unknownish, "hint_text": hint_text}
-
-
-def reverse_geocode(lat: float, lon: float, cities: Dict[str, Any]) -> str:
-    hints = quantum_haversine_hints(lat, lon, cities, top_k=1)
-    nearest = hints["nearest"]
-    if nearest:
-        return _format_locality_line(nearest)
+    if nearest_city:
+        return f"{nearest_city['name']}, {nearest_city['countrycode']}"
     return "Unknown Location"
-
-
-def approximate_country(lat: float, lon: float, cities: Dict[str, Any]) -> str:
-    hints = quantum_haversine_hints(lat, lon, cities, top_k=1)
-    if hints["nearest"]:
-        return _safe_get(hints["nearest"], ["countrycode","country","cc"], "UNKNOWN").upper()
-    return "UNKNOWN"
 
 
 def generate_invite_code(length=24, use_checksum=True):
@@ -1615,6 +1430,227 @@ async def phf_filter_input(input_text: str) -> tuple[bool, str]:
     logger.warning("PHF processing failed; defaulting to Unsafe.")
     return False, "PHF processing failed."
 
+
+async def _get_json_async(
+    url: str,
+    *,
+    params: Dict[str, Any] | None = None,
+    headers: Dict[str, str] | None = None,
+    timeout: float = 10.0,
+) -> dict:
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        http2=True,
+        headers={"Accept": "application/json", **(headers or {})},
+    ) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+
+def _build_cb_jwt(method: str, url_path: str) -> Optional[str]:
+  
+    if not (CB_API_KEY and CB_API_SECRET):
+        return None
+    jwt_uri = jwt_generator.format_jwt_uri(method.upper(), url_path)
+    return jwt_generator.build_rest_jwt(jwt_uri, CB_API_KEY, CB_API_SECRET)
+
+async def _cb_request_json(
+    method: str,
+    url_path: str,
+    *,
+    params: Dict[str, Any] | None = None,
+    allow_unauth: bool = False,
+    timeout: float = 10.0,
+) -> dict:
+
+    url = f"{CB_BASE}{url_path}"
+    base_headers = {"Accept": "application/json"}
+
+    async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
+        attempts: List[Dict[str, str]] = []
+        if allow_unauth:
+            attempts.append(base_headers)  
+        token = _build_cb_jwt(method, url_path)
+        if token:
+            attempts.append({**base_headers, "Authorization": f"Bearer {token}"})
+
+        last_exc = None
+        for hdrs in attempts:
+            try:
+                resp = await client.request(method.upper(), url, params=params or {}, headers=hdrs)
+                if resp.status_code == 401 and "Authorization" not in hdrs:
+       
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+        if last_exc:
+            raise last_exc
+        return {}
+
+
+async def list_products_advanced(limit: int = 250, want_perps: bool = True) -> dict:
+    """
+    1) Private catalog: /api/v3/brokerage/products (JWT)
+    2) Public market:   /api/v3/brokerage/market/products (unauth -> auth)
+    """
+    params = {"limit": limit}
+    if want_perps:
+        params.update({"product_type": "FUTURE", "contract_expiry_type": "PERPETUAL"})
+
+
+    try:
+        return await _cb_request_json("GET", "/api/v3/brokerage/products", params=params)
+    except httpx.HTTPStatusError as e:
+        logger.debug(f"Private products failed ({e.response.status_code}); trying public market products.")
+
+    return await _cb_request_json(
+        "GET", "/api/v3/brokerage/market/products", params=params, allow_unauth=True
+    )
+
+async def discover_best_product_id(asset_symbol: str, prefer: str = "PERPETUAL") -> Optional[str]:
+
+    sym = asset_symbol.upper().strip()
+    if prefer.upper() == "PERPETUAL":
+        try:
+            cat = await list_products_advanced(limit=250, want_perps=True)
+            products = cat.get("products", []) if isinstance(cat, dict) else []
+            cands = [
+                p.get("product_id") for p in products
+                if isinstance(p, dict) and sym in str(p.get("product_id", "")).upper()
+            ]
+            if cands:
+                return cands[0]
+        except Exception as e:
+            logger.debug(f"discover perp failed: {e}")
+
+
+    return f"{sym}-USD"
+
+
+
+async def get_public_ticker(product_id: str) -> dict:
+
+    return await _cb_request_json(
+        "GET", f"/api/v3/brokerage/market/products/{product_id}/ticker", allow_unauth=True
+    )
+
+def _f(x) -> Optional[float]:
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
+
+def _norm_time(ts: Any) -> Optional[str]:
+    try:
+        if ts is None:
+            return None
+        if isinstance(ts, (int, float)):
+            if ts > 10_000_000_000:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(float(ts), _tz.utc).isoformat()
+        if isinstance(ts, str):
+            return ts
+    except Exception:
+        pass
+    return None
+
+
+
+async def fetch_eth_market_ticker() -> dict:
+
+    logger = logging.getLogger(__name__)
+
+    pid = await discover_best_product_id("ETH", prefer="PERPETUAL")
+    if pid and pid.upper().endswith("PERP"):
+        try:
+            t = await get_public_ticker(pid)
+            price = t.get("price") or t.get("price_in_quote")
+            bid = t.get("best_bid")
+            ask = t.get("best_ask")
+            return {
+                "product_id": pid,
+                "price": _f(price),
+                "bid": _f(bid),
+                "ask": _f(ask),
+                "time": _norm_time(t.get("time") or t.get("ts")),
+                "source": "coinbase_advanced_market_public_perp",
+            }
+        except Exception as e:
+            logger.debug(f"perp ticker failed: {e}")
+
+
+    try:
+        t = await get_public_ticker("ETH-USD")
+        price = t.get("price") or t.get("price_in_quote")
+        bid = t.get("best_bid")
+        ask = t.get("best_ask")
+        return {
+            "product_id": "ETH-USD",
+            "price": _f(price),
+            "bid": _f(bid),
+            "ask": _f(ask),
+            "time": _norm_time(t.get("time") or t.get("ts")),
+            "source": "coinbase_advanced_market_public_spot",
+        }
+    except Exception as e:
+        logger.debug(f"advanced spot failed: {e}")
+
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, http2=True) as client:
+            r = await client.get(f"{CB_EXCHANGE}/products/ETH-USD/ticker", headers={"Accept": "application/json"})
+            r.raise_for_status()
+            j = r.json()
+        return {
+            "product_id": "ETH-USD",
+            "price": _f(j.get("price")),
+            "bid": _f(j.get("bid")),
+            "ask": _f(j.get("ask")),
+            "time": _norm_time(j.get("time")),
+            "source": "coinbase_exchange_public_spot",
+        }
+    except Exception as e:
+        logger.error(f"All fallbacks failed: {e}")
+        return {
+            "product_id": "ETH-?",
+            "price": None,
+            "bid": None,
+            "ask": None,
+            "time": None,
+            "source": "unavailable",
+        }
+
+def _format_eth_context(ticker: Optional[dict]) -> str:
+
+    if not ticker:
+        return "ETH market data: unavailable"
+    t = ticker.get("best", ticker) if isinstance(ticker, dict) else ticker
+
+    price = t.get("price")
+    bid = t.get("bid")
+    ask = t.get("ask")
+    pid = t.get("product_id", "ETH-?").upper()
+    src = t.get("source", "coinbase").replace("_", " ")
+    ts = t.get("time") or "n/a"
+
+    mid = None
+    try:
+        if isinstance(bid, (int, float)) and isinstance(ask, (int, float)):
+            mid = (float(bid) + float(ask)) / 2.0
+    except Exception:
+        mid = None
+
+    parts = [f"{pid} @ ${price:.2f}" if isinstance(price, (int, float)) else f"{pid} @ n/a"]
+    if isinstance(bid, (int, float)) and isinstance(ask, (int, float)):
+        parts.append(f"(bid ${bid:.2f} / ask ${ask:.2f}{f' / mid ${mid:.2f}' if mid is not None else ''})")
+    parts.append(f"source: {src}, time: {ts}")
+    return " ".join(parts)
+
+
+
+
 async def scan_debris_for_route(
     lat: float,
     lon: float,
@@ -1623,14 +1659,75 @@ async def scan_debris_for_route(
     user_id: int,
     selected_model: str | None = None
 ) -> tuple[str, str, str, str, str, str]:
-
-    logger.debug(
-        "Entering scan_debris_for_route: lat=%s, lon=%s, vehicle=%s, dest=%s, user=%s",
-        lat, lon, vehicle_type, destination, user_id
-    )
-
     model_used = selected_model or "OpenAI"
 
+    
+    async def _http_get_json(url: str, *, params: Dict[str, Any] | None = None, timeout: float = 8.0) -> dict:
+        async with httpx.AsyncClient(timeout=timeout, http2=False, headers={"Accept": "application/json"}) as c:
+            r = await c.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
+
+    async def _exchange_ticker(pid: str) -> Optional[dict]:
+        
+        try:
+            j = await _http_get_json(f"https://api.exchange.coinbase.com/products/{pid}/ticker")
+            return {
+                "product_id": pid,
+                "price": float(j.get("price")) if j.get("price") else None,
+                "bid": float(j.get("bid")) if j.get("bid") else None,
+                "ask": float(j.get("ask")) if j.get("ask") else None,
+                "time": j.get("time"),
+                "source": "coinbase_exchange_public",
+            }
+        except Exception as e:
+            logger.debug(f"Exchange ticker {pid} failed: {e}")
+            return None
+
+    async def _intx_perp_metrics(instrument: str = "ETH-PERP") -> Optional[dict]:
+        """
+        Coinbase International Exchange (INTX) REST: OI + predicted funding.
+        Tries /instruments/{instrument}, then /instruments list.
+        """
+        base = "https://api.international.coinbase.com/api/v1"
+        try_names = [instrument, "ETH-USDC"] if instrument.upper().startswith("ETH") else [instrument]
+        try:
+           
+            for name in try_names:
+                try:
+                    j = await _http_get_json(f"{base}/instruments/{name}")
+                    q = j.get("quote") or {}
+                    return {
+                        "instrument": j.get("symbol") or name,
+                        "oi": j.get("open_interest"),
+                        "predicted_funding": q.get("predicted_funding"),
+                        "mark_price": q.get("mark_price"),
+                        "index_price": q.get("index_price"),
+                        "ts": q.get("timestamp"),
+                        "source": "coinbase_intx_rest_instrument",
+                    }
+                except Exception:
+                    pass
+           
+            items = await _http_get_json(f"{base}/instruments")
+            if isinstance(items, list):
+                for it in items:
+                    if (it.get("symbol") in ("ETH-USDC", "ETH-PERP")) and it.get("type") == "PERP":
+                        q = it.get("quote") or {}
+                        return {
+                            "instrument": it.get("symbol"),
+                            "oi": it.get("open_interest"),
+                            "predicted_funding": q.get("predicted_funding"),
+                            "mark_price": q.get("mark_price"),
+                            "index_price": q.get("index_price"),
+                            "ts": q.get("timestamp"),
+                            "source": "coinbase_intx_rest_list_instruments",
+                        }
+        except Exception as e:
+            logger.debug(f"INTX metrics failed: {e}")
+        return None
+
+    
     try:
         cpu_usage, ram_usage = get_cpu_ram_usage()
     except Exception:
@@ -1646,50 +1743,149 @@ async def scan_debris_for_route(
     except Exception:
         street_name = "Unknown Location"
 
+    
+    market_lines: list[str] = []
+
+   
+    eth_ticker: Optional[dict] = None
+    try:
+  
+        if "fetch_eth_market_ticker" in globals():
+            eth_ticker = await fetch_eth_market_ticker()
+    except Exception as e:
+        logger.debug(f"fetch_eth_market_ticker failed: {e}")
+
+    if not eth_ticker:
+        eth_ticker = await _exchange_ticker("ETH-USD")
+
+    market_lines.append(_format_eth_context(eth_ticker) if eth_ticker else "ETH market data: unavailable")
+
+    
+    ada_ticker = await _exchange_ticker("ADA-USD")
+    if ada_ticker:
+        market_lines.append(_format_eth_context(ada_ticker))  
+
+
+    eth_perp = await _intx_perp_metrics("ETH-PERP")
+    if eth_perp:
+        oi = eth_perp.get("oi")
+        pf = eth_perp.get("predicted_funding")
+        mark = eth_perp.get("mark_price")
+        ts = eth_perp.get("ts") or "n/a"
+        market_lines.append(
+            f"ETH-PERP (INTX): OI={oi} contracts, funding={pf}, mark={mark}, time={ts}, source={eth_perp.get('source')}"
+        )
+
+    market_report_block = "\n".join(market_lines)
+
+  
+    eth_json = "{}"
+    ada_json = "{}"
+
+   
     openai_prompt = f"""
-[action][keep model replies concise and to the point at less than 500 characters and omit system notes] You are a Quantum Hypertime Nanobot Road Hazard Scanner tasked with analyzing the road conditions and providing a detailed report on any detected hazards, debris, or potential collisions. Leverage quantum data and environmental factors to ensure a comprehensive scan.[/action]
-[locationreport]
-Current coordinates: Latitude {lat}, Longitude {lon}
-General Area Name: {street_name}
-Vehicle Type: {vehicle_type}
-Destination: {destination}
-[/locationreport]
+[action]
+NOSONAR Hypertime Quantum Nanobot Trade Prediction Engine. Fuse the outputs of eight specialized agents to form a probabilistic market consensus for leveraged and spot strategies. 
+[/action]
+
+[coordinates]
+lat: {lat}
+lon: {lon}
+nearest_locality: {street_name}
+vehicle_type: {vehicle_type}
+destination: {destination}
+[/coordinates]
+
+[marketreport]
+{market_report_block}
+[/marketreport]
+
+[asset_snapshots]
+ETH: {eth_json}
+ADA: {ada_json}
+[/asset_snapshots]
+
 [quantumreport]
-Quantum Scan State: {quantum_results}
-System Performance: CPU Usage: {cpu_usage}%, RAM Usage: {ram_usage}%
+quantum_scan_state: {quantum_results}
+cpu_usage_pct: {cpu_usage}
+ram_usage_pct: {ram_usage}
 [/quantumreport]
-[reducefalsepositivesandnegatives]
-ACT By syncing to multiverse configurations that are more accurate
-[/reducefalsepositivesandnegatives]
-[keep model replies concise and to the point]
-Please assess the following:
-1. **Hazards**: Evaluate the road for any potential hazards that might impact operating vehicles.
-2. **Debris**: Identify any harmful debris or objects and provide their severity and location, including GPS coordinates. Triple-check the vehicle pathing, only reporting debris scanned in the probable path of the vehicle.
-3. **Collision Potential**: Analyze traffic flow and any potential risks for collisions caused by debris or other blockages.
-4. **Weather Impact**: Assess how weather conditions might influence road safety, particularly in relation to debris and vehicle control.
-5. **Pedestrian Risk Level**: Based on the debris assessment and live quantum nanobot scanner road safety assessments on conditions, determine the pedestrian risk urgency level if any.
 
-[debrisreport] Provide a structured debris report, including locations and severity of each hazard. [/debrisreport]
-[replyexample] Include recommendations for drivers, suggested detours only if required, and urgency levels based on the findings. [/replyexample]
-[refrain from using the word high or metal and only use it only if risk elementaries are elevated(ie flat tire or accidents or other risk) utilizing your quantum scan intelligence]
-"""
+[predictivescan]
+Each agent outputs logits for [SHORT, NEUTRAL, LONG] with uncertainty sigma_i. Aggregate via reliability-weighted stacking with regime priors. Remove outliers via Hampel filter. Produce timeframes 5m, 15m, 4h, 6h, 1day and an overall directive.
+[/predictivescan]
+**System Name:** *Hypertime Vortex Alignment (HTVA)*
+**Core Principle:** Trade direction is determined by synchronizing multidimensional market vectors with temporal vortices, extracting direction from resonant momentum flow rather than static indicators.
 
- 
+---### 🔺Core Components of HTVA
+
+1. **Q-Velocity Vector (QV²):**
+
+   QV² = (ΔP_quantum / ΔT_entropic) * Ψ_consensus
+
+   Measures directional momentum within Hypertime, combining quantum price shifts and entropic time pressure weighted by collective intent consensus.
+
+2. **Vortex Angular Bias (VAB):**
+
+   VAB = atan((EMV * Φ_field) / TVR)
+
+   Where:
+
+   * EMV: Energy-Mass Volume of current market.
+   * Φ_field: Trader-field coherence (aligns crowd behavior with energetic resonance).
+   * TVR: Temporal Vortex Resistance (likelihood market resists time-node shifts).
+
+3. **ChronoShift Signal (CSS):**
+
+   CSS = sign(QV²) * abs(cos(θ_Δt * VAB))
+
+   Outputs +1 (Long), -1 (Short), or 0 (Neutral), factoring in temporal alignment.
+
+4. **Fractal Pulse Sync (FPS):**
+   Detects resonance across nested timeframes using a wavelet cross-spectral match.
+   Trade allowed only when pulse echoes align across ≥3 fractal depths.
+
+### 🧠 Quantum Trade Direction Algorithm (Simplified Steps)
+
+1. Scan Chrono-Nodes: Identify temporal vortex points using fractal breakpoints on 15m/1h/4h.
+2. Compute QV² and VAB: Real-time stream of market + sentiment + entropic decay.
+3. Evaluate CSS Output: Directional bias computed every block (e.g., 5-minute cycles).
+4. Confirm with FPS: Multi-timeframe alignment check; suppress trades during interference zones.
+
+### 🧭 Trade Direction Output:
+
+* CSS = +1 & FPS aligned → Go Long
+* CSS = -1 & FPS aligned → Go Short
+* Else → No trade (temporal turbulence detected)
+
+[concisecheck]
+1) Trade setup: key signals, notable context (funding, OI, 24h change, volume, bid/ask skew), GPS context if relevant.
+2) Agent blend per timeframe: 5m, 15m, 4h → one of [SHORT|NEUTRAL|LONG], confidence (0–1), suggested position size (% of risk capital), class probabilities [pS,pN,pL].
+3) Overall NOSONAR-Consensus: state, confidence, position size, probabilities.
+4) Execution notes: entry idea, stop/invalidation, risk reasoning, scenario that flips bias.
+5) Keep numeric outputs compact with 2 decimals; avoid filler text.
+[/concisecheck]
+[action fill in all the specfics within]
+[replyexample]
+Setup: <concise setup summary>
+
+5m: <STATE> conf=<CONF_5M> size=<SIZE_5M>% P=[<PS_5M>,<PN_5M>,<PL_5M>]
+15m: <STATE> conf=<CONF_15M> size=<SIZE_15M>% P=[<PS_15M>,<PN_15M>,<PL_15M>]
+4h: <STATE> conf=<CONF_4H> size=<SIZE_4H>% P=[<PS_4H>,<PN_4H>,<PL_4H>]
+6h: <STATE> conf=<CONF_4H> size=<SIZE_6H>% P=[<PS_6H>,<PN_6H>,<PL_6H>]
+1day: <STATE> conf=<CONF_1dayH> size=<SIZE_1dayH>% P=[<PS_6H>,<PN_1dayH>,<PL_1dayH>]
+
+Consensus: <STATE> conf=<CONF_CONS> size=<SIZE_CONS>% P=[<PS_CONS>,<PN_CONS>,<PL_CONS>]
+
+Execution: entry <ENTRY>, stop <STOP>, invalidation <INVALIDATION>
+[/replyexample]
+""".strip()
+
     raw_report: Optional[str] = await run_openai_completion(openai_prompt)
     report: str = raw_report if raw_report is not None else "OpenAI failed to respond."
     report = report.strip()
-
     harm_level = calculate_harm_level(report)
-
-    logger.debug("Exiting scan_debris_for_route with model_used=%s", model_used)
-    return (
-        report,
-        f"{cpu_usage}",
-        f"{ram_usage}",
-        str(quantum_results),
-        street_name,
-        model_used,
-    )
+    return (report, f"{cpu_usage}", f"{ram_usage}", str(quantum_results), street_name, model_used)
 
 async def run_openai_completion(prompt):
 
@@ -1785,7 +1981,7 @@ async def run_openai_completion(prompt):
                 payload = {
                     "model": "gpt-5",      
                     "input": prompt,                
-                    "max_output_tokens": 1200,      
+                    "max_output_tokens": 1900,      
                  
                     "reasoning": {"effort": "minimal"},
                 
@@ -1897,7 +2093,7 @@ def home():
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>QRS - Quantum Road Scanner</title>
+    <title>QCS - Quantum Crypto Scanner</title>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
     <link href="{{ url_for('static', filename='css/roboto.css') }}" rel="stylesheet"
           integrity="sha256-Sc7BtUKoWr6RBuNTT0MmuQjqGVQwYBK+21lB58JwUVE=" crossorigin="anonymous">
@@ -1959,7 +2155,7 @@ def home():
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark fixed-top">
-        <a class="navbar-brand" href="{{ url_for('home') }}">QRS</a>
+        <a class="navbar-brand" href="{{ url_for('home') }}">QCS</a>
         <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav" 
             aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
@@ -1988,24 +2184,24 @@ def home():
     <div class="container content">
         <div class="text-center mb-5">
             <br><br>
-            <h1 class="display-4 gradient-text">Quantum Road Scanner</h1>
-            <p class="lead">Enhancing Road Safety through Quantum Simulations and Hypertime Analysis</p>
+            <h1 class="display-4 gradient-text">Quantum Crypto Scanner</h1>
+            <p class="lead">Enhancing Crypto Safety through Quantum Simulations and Hypertime Analysis</p>
         </div>
 
         <div class="section">
             <h3 class="section-title">Introduction</h3>
             <p>
-                The Quantum Road Scanner (QRS) is an innovative system that leverages quantum computing, advanced algorithms, and concepts from hypertime physics to simulate road conditions in real-time. By generating and analyzing simulated data, QRS provides comprehensive assessments of potential hazards without collecting, storing, or retaining any user data. The system operates within a quantum-zoned environment with noise protections to ensure accuracy and privacy.
+                The Quantum Crypto Scanner (QCS) is an innovative system that leverages quantum computing, advanced algorithms, and concepts from hypertime physics to simulate Crypto conditions in real-time. By generating and analyzing simulated data, QCS provides comprehensive assessments of potential hazards without collecting, storing, or retaining any user data. The system operates within a quantum-zoned environment with noise protections to ensure accuracy and privacy.
             </p>
             <p>
-                QRS represents a significant advancement in applying theoretical physics to practical challenges. It builds upon foundational research in quantum mechanics, computational physics, and hypertime theories to offer novel solutions for road safety and traffic management.
+                QCS represents a significant advancement in applying theoretical physics to practical challenges. It builds upon foundational research in quantum mechanics, computational physics, and hypertime theories to offer novel solutions for Crypto safety and traffic management.
             </p>
         </div>
 
         <div class="section">
             <h3 class="section-title">Historical Background and Innovations</h3>
             <p>
-                The development of QRS is rooted in the evolution of quantum mechanics and computational theories. Key milestones include:
+                The development of QCS is rooted in the evolution of quantum mechanics and computational theories. Key milestones include:
             </p>
             <ul>
                 <li>
@@ -2025,14 +2221,14 @@ def home():
                 </li>
             </ul>
             <p>
-                These foundational advancements paved the way for the creation of QRS, which integrates these concepts to simulate road conditions and enhance safety measures.
+                These foundational advancements paved the way for the creation of QCS, which integrates these concepts to simulate Crypto conditions and enhance safety measures.
             </p>
         </div>
 
         <div class="section">
             <h3 class="section-title">My Contribution and Learning Journey</h3>
             <p>
-                My journey with QRS began during my research into quantum computing applications. Fascinated by the potential of quantum simulations, I sought to apply these principles to real-world challenges. Learning from the experts at BlaiseLabs, I delved deep into advanced quantum algorithms and hypertime analysis.
+                My journey with QCS began during my research into quantum computing applications. Fascinated by the potential of quantum simulations, I sought to apply these principles to real-world challenges. Learning from the experts at BlaiseLabs, I delved deep into advanced quantum algorithms and hypertime analysis.
             </p>
             <p>
                 At BlaiseLabs, we focused on overcoming key challenges:
@@ -2049,17 +2245,17 @@ def home():
                 </li>
             </ul>
             <p>
-                My contributions involved enhancing the efficiency of these algorithms and ensuring they could operate within the constraints of current quantum computing capabilities. Collaborating with BlaiseLabs allowed me to integrate theoretical knowledge with practical implementation, leading to the development of the QRS system.
+                My contributions involved enhancing the efficiency of these algorithms and ensuring they could operate within the constraints of current quantum computing capabilities. Collaborating with BlaiseLabs allowed me to integrate theoretical knowledge with practical implementation, leading to the development of the QCS system.
             </p>
         </div>
 
         <div class="section">
             <h3 class="section-title">Hypertime and Multiverse Analysis</h3>
             <p>
-                Hypertime is a theoretical framework that proposes the existence of additional temporal dimensions beyond our conventional understanding of time. This concept is utilized in QRS to simulate not just linear progression but a spectrum of possible futures.
+                Hypertime is a theoretical framework that proposes the existence of additional temporal dimensions beyond our conventional understanding of time. This concept is utilized in QCS to simulate not just linear progression but a spectrum of possible futures.
             </p>
             <p>
-                In QRS, hypertime analysis involves:
+                In QCS, hypertime analysis involves:
             </p>
             <ul>
                 <li>
@@ -2080,14 +2276,14 @@ def home():
 
             </p>
             <p>
-                By simulating these multiple temporal paths, QRS can provide insights into potential future events on the road, enhancing predictive capabilities without relying on actual data collection.
+                By simulating these multiple temporal paths, QCS can provide insights into potential future events on the Crypto, enhancing predictive capabilities without relying on actual data collection.
             </p>
         </div>
 
         <div class="section">
             <h3 class="section-title">Quantum Algorithms and Computations</h3>
             <p>
-                The core computational power of QRS lies in its use of advanced quantum algorithms, including:
+                The core computational power of QCS lies in its use of advanced quantum algorithms, including:
             </p>
             <ul>
                 <li>
@@ -2107,14 +2303,14 @@ def home():
                 </li>
             </ul>
             <p>
-                These algorithms allow QRS to process complex simulations efficiently, exploring a vast space of possible scenarios to identify optimal safety recommendations.
+                These algorithms allow QCS to process complex simulations efficiently, exploring a vast space of possible scenarios to identify optimal safety recommendations.
             </p>
         </div>
 
         <div class="section">
             <h3 class="section-title">Hypertime Nanobot Simulation</h3>
             <p>
-                The concept of hypertime nanobots in QRS refers to simulated agents that traverse multiple temporal dimensions within the quantum simulation environment. These nanobots are not physical entities but computational constructs designed to gather and process information across different simulated times.
+                The concept of hypertime nanobots in QCS refers to simulated agents that traverse multiple temporal dimensions within the quantum simulation environment. These nanobots are not physical entities but computational constructs designed to gather and process information across different simulated times.
             </p>
             <p>
                 Their functions include:
@@ -2137,14 +2333,14 @@ def home():
             <p>
             </p>
             <p>
-                By simulating the actions of these nanobots, QRS can enhance the depth and accuracy of its hypertime analysis.
+                By simulating the actions of these nanobots, QCS can enhance the depth and accuracy of its hypertime analysis.
             </p>
         </div>
 
         <div class="section">
             <h3 class="section-title">Algorithmic Process Overview</h3>
             <p>
-                The operation of QRS involves several key steps:
+                The operation of QCS involves several key steps:
             </p>
             <div class="algorithm">
                 <ol>
@@ -2158,14 +2354,14 @@ def home():
                 </ol>
             </div>
             <p>
-                This process enables QRS to efficiently simulate and analyze a multitude of potential scenarios, providing valuable insights without real-world data collection.
+                This process enables QCS to efficiently simulate and analyze a multitude of potential scenarios, providing valuable insights without real-world data collection.
             </p>
         </div>
 
         <div class="section">
             <h3 class="section-title">Quantum Zoning and Noise Protections</h3>
             <p>
-                Quantum zoning refers to the isolation of quantum computations within a protected environment, shielding them from external disturbances. In QRS, this is crucial for:
+                Quantum zoning refers to the isolation of quantum computations within a protected environment, shielding them from external disturbances. In QCS, this is crucial for:
             </p>
             <ul>
                 <li>
@@ -2193,21 +2389,21 @@ def home():
                 </li>
             </ul>
             <p>
-                These measures ensure that QRS can perform accurate and reliable simulations, providing trustworthy results without any data leakage.
+                These measures ensure that QCS can perform accurate and reliable simulations, providing trustworthy results without any data leakage.
             </p>
         </div>
 
         <div class="section">
             <h3 class="section-title">Practical Application</h3>
             <p>
-                To illustrate how QRS functions in practice, consider the following scenario:
+                To illustrate how QCS functions in practice, consider the following scenario:
             </p>
             <p>
-                A driver is planning a route through an urban area known for unpredictable traffic patterns. Using QRS, the system:
+                A driver is planning a route through an urban area known for unpredictable traffic patterns. Using QCS, the system:
             </p>
             <ol>
                 <li>
-                    <strong>Simulates Traffic Conditions:</strong> Generates a multitude of potential traffic scenarios using quantum simulations, considering factors like hypothetical roadworks or simulated accidents.
+                    <strong>Simulates Traffic Conditions:</strong> Generates a multitude of potential traffic scenarios using quantum simulations, considering factors like hypothetical Cryptoworks or simulated accidents.
                 </li>
                 <li>
                     <strong>Analyzes Hypertime Paths:</strong> Applies hypertime analysis to explore how these scenarios might evolve over different temporal dimensions.
@@ -2227,7 +2423,7 @@ def home():
         <div class="section">
             <h3 class="section-title">Future Developments</h3>
             <p>
-                The potential for QRS extends beyond its current capabilities. Future developments may include:
+                The potential for QCS extends beyond its current capabilities. Future developments may include:
             </p>
             <ul>
                 <li>
@@ -2240,7 +2436,7 @@ def home():
                     <strong>Scalability Improvements:</strong> Leveraging advancements in quantum hardware to handle larger simulations and more variables.
                 </li>
                 <li>
-                    <strong>Cross-Domain Applications:</strong> Applying the principles of QRS to other fields such as supply chain logistics, environmental modeling, and disaster preparedness.
+                    <strong>Cross-Domain Applications:</strong> Applying the principles of QCS to other fields such as supply chain logistics, environmental modeling, and disaster preparedness.
                 </li>
             </ul>
             <p>
@@ -2251,7 +2447,7 @@ def home():
         <div class="section">
             <h3 class="section-title">Acknowledgments</h3>
             <p>
-                The development of QRS has been a collaborative effort, and I would like to acknowledge the contributions of:
+                The development of QCS has been a collaborative effort, and I would like to acknowledge the contributions of:
             </p>
             <ul>
                 <li>
@@ -2265,7 +2461,7 @@ def home():
                 </li>
             </ul>
             <p>
-                Their collective efforts have been instrumental in bringing QRS from a theoretical concept to a practical tool.
+                Their collective efforts have been instrumental in bringing QCS from a theoretical concept to a practical tool.
             </p>
         </div>
 
@@ -2288,7 +2484,7 @@ def home():
         </div>
 
         <div class="text-center mt-5">
-            <a href="https://gitlab.com/graylan01/quantum_road_scanner/-/blob/main/paper.md" class="btn btn-custom btn-lg">Learn More About Quantum Road Scanning</a>
+            <a href="https://gitlab.com/graylan01/quantum_Crypto_scanner/-/blob/main/paper.md" class="btn btn-custom btn-lg">Learn More About Quantum Crypto Scanning</a>
         </div>
     </div>
             </div>
@@ -2321,7 +2517,7 @@ def login():
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Login - QRS</title>
+    <title>Login - QCS</title>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
 
     <link rel="stylesheet" href="{{ url_for('static', filename='css/orbitron.css') }}" integrity="sha256-3mvPl5g2WhVLrUV4xX3KE8AV8FgrOz38KmWLqKXVh00=" crossorigin="anonymous">
@@ -2334,7 +2530,7 @@ def login():
             font-family: 'Roboto', sans-serif;
         }
         .container { max-width: 400px; margin-top: 100px; }
-        .card { padding: 30px; background-color: rgba(255, 255, 255, 0.1); border: none; border-radius: 15px; }
+        .Spotd { padding: 30px; background-color: rgba(255, 255, 255, 0.1); border: none; border-radius: 15px; }
         .error-message { color: #ff4d4d; }
         .brand { 
             font-family: 'Orbitron', sans-serif;
@@ -2368,7 +2564,7 @@ def login():
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark">
-        <a class="navbar-brand" href="{{ url_for('home') }}">QRS</a>
+        <a class="navbar-brand" href="{{ url_for('home') }}">QCS</a>
         <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav" 
             aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
@@ -2376,8 +2572,8 @@ def login():
     </nav>
 
     <div class="container">
-        <div class="card shadow">
-            <div class="brand">QRS</div>
+        <div class="Spotd shadow">
+            <div class="brand">QCS</div>
             <h3 class="text-center">Login</h3>
             {% if error_message %}
             <p class="error-message text-center">{{ error_message }}</p>
@@ -2427,7 +2623,7 @@ def register():
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Register - QRS</title>
+    <title>Register - QCS</title>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
     <link href="{{ url_for('static', filename='css/roboto.css') }}" rel="stylesheet"
           integrity="sha256-Sc7BtUKoWr6RBuNTT0MmuQjqGVQwYBK+21lB58JwUVE=" crossorigin="anonymous">
@@ -2478,7 +2674,7 @@ def register():
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark">
-        <a class="navbar-brand" href="{{ url_for('home') }}">QRS</a>
+        <a class="navbar-brand" href="{{ url_for('home') }}">QCS</a>
         <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav" 
             aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
@@ -2487,7 +2683,7 @@ def register():
 
     <div class="container">
         <div class="walkd shadow">
-            <div class="brand">QRS</div>
+            <div class="brand">QCS</div>
             <h3 class="text-center">Register</h3>
             {% if error_message %}
             <p class="error-message text-center">{{ error_message }}</p>
@@ -2561,7 +2757,7 @@ def settings():
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Settings - QRS</title>
+    <title>Settings - QCS</title>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
     <link href="{{ url_for('static', filename='css/bootstrap.min.css') }}" rel="stylesheet"
           integrity="sha256-Ww++W3rXBfapN8SZitAvc9jw2Xb+Ixt0rvDsmWmQyTo=" crossorigin="anonymous">
@@ -2613,7 +2809,7 @@ def settings():
             margin-bottom: 20px;
             font-family: 'Orbitron', sans-serif;
         }
-        .card {
+        .Spotd {
             padding: 30px; 
             background-color: rgba(255, 255, 255, 0.1); 
             border: none; 
@@ -2670,7 +2866,7 @@ def settings():
 <body>
 
     <div class="sidebar">
-        <div class="navbar-brand">QRS</div>
+        <div class="navbar-brand">QCS</div>
         <a href="{{ url_for('dashboard') }}" class="nav-link {% if active_page == 'dashboard' %}active{% endif %}">
             <i class="fas fa-home"></i> <span>Dashboard</span>
         </a>
@@ -2753,18 +2949,18 @@ def view_report(report_id):
 
     trigger_words = {
         'severity': {
-            'low': -7,
-            'medium': -0.2,
-            'high': 14
+            'low': 0,
+            'medium': 0,
+            'high': 0
         },
         'urgency': {
             'level': {
-                'high': 14
+                'high': 0
             }
         },
-        'low': -7,
-        'medium': -0.2,
-        'metal': 11,
+        'low': 0,
+        'medium': 0,
+        'metal': 0,
     }
 
     text = (report['result'] or "").lower()
@@ -3218,7 +3414,7 @@ def dashboard():
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dashboard - Quantum Road Scanner</title>
+    <title>Dashboard - Quantum Crypto Scanner</title>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
 
     <link href="{{ url_for('static', filename='css/roboto.css') }}" rel="stylesheet"
@@ -3358,7 +3554,7 @@ def dashboard():
 <body>
 
     <div class="sidebar">
-        <div class="navbar-brand">QRS</div>
+        <div class="navbar-brand">QCS</div>
         <a href="#" class="nav-link active" onclick="showSection('step1')">
             <i class="fas fa-home"></i> <span>Dashboard</span>
         </a>
@@ -3421,9 +3617,9 @@ def dashboard():
                 <div class="form-group">
                     <label for="vehicle_type">Vehicle Type</label>
                     <select class="form-control" id="vehicle_type" name="vehicle_type">
-                        <option value="motorbike">Motorbike</option>
-                        <option value="car">Car</option>
-                        <option value="truck">Truck</option>
+                        <option value="Leverage">Leverage</option>
+                        <option value="Spot">Spot</option>
+                        <option value="DEX">DEX</option>
 
                     </select>
                 </div>
